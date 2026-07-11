@@ -23,6 +23,7 @@
 static WebServer  portalSrv(80);
 static DNSServer  portalDns;
 static bool       portalActive   = false;
+static bool       portalBleWasOn = false;   // BLE state to restore on stop
 static char       portalSsid[20] = "SecureKey-Setup";
 static char       portalPass[12] = {0};   // random WPA2 (8 chars)
 static char       portalCode[7]  = {0};   // 6-digit on-screen gate
@@ -254,10 +255,32 @@ void wifiPortalStart() {
   portalCode[6] = 0;
   portalImported = 0; portalNeedReload = false;
 
+  // ── Restart-bug mitigation ──────────────────────────────────────────
+  // The Wi-Fi AP is the highest-current thing this device does. Two things
+  // used to make it reset (esp. on a small battery):
+  //   1. BLE was left running — WiFi + BLE share ONE 2.4 GHz radio, so the
+  //      peak TX current and coexistence arbitration both spiked.
+  //   2. The AP came up at full TX power (~19.5 dBm).
+  // So: drop BLE first (restored in wifiPortalStop), and cap AP TX power —
+  // the phone is inches away for a captive portal, it doesn't need full blast.
+  Serial.printf("[WIFI] pre-start heap: free=%u minfree=%u\n",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  portalBleWasOn = settings.bleEnabled && hidBleCompiled() && hidBleStarted();
+  if (portalBleWasOn) {
+    Serial.println("[WIFI] stopping BLE before AP (shared radio)");
+    hidBleEnd();
+    bleAuthorized = false;
+    btConnected = false;
+    delay(60);
+  }
+
   WiFi.mode(WIFI_AP);
   // channel 1, not hidden, MAX 1 client
   WiFi.softAP(portalSsid, portalPass, 1, 0, 1);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);            // cut the current spike
   delay(100);
+  Serial.printf("[WIFI] post-start heap: free=%u minfree=%u\n",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap());
   portalDns.start(53, "*", WiFi.softAPIP());     // all domains → us
 
   portalSrv.on("/",       HTTP_GET,  portalSendHtml);
@@ -282,6 +305,13 @@ void wifiPortalStop() {
   WiFi.mode(WIFI_OFF);
   portalActive = false;
   Serial.println("[WIFI] portal stopped");
+
+  // Bring BLE back if we shut it down for the AP.
+  if (portalBleWasOn && settings.bleEnabled && hidBleCompiled()) {
+    Serial.println("[WIFI] resuming BLE after AP");
+    hidBleBegin();
+  }
+  portalBleWasOn = false;
 }
 
 // Call every loop(). Services the portal and auto-stops after idle.

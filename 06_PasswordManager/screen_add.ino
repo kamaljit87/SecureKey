@@ -143,21 +143,21 @@ void addNextField() {
     drawSavedSplash();
     delay(700);
 
+    // Fully close the add/edit flow: clear the form, the keyboard, the edit
+    // target and the whole nav stack, and land on a clean Home screen. (Was
+    // dropping onto the Passwords list; per request, saving now closes
+    // everything out.)
     addField = 0;
     memset(&addRec, 0, sizeof(addRec));
     kbReset();
-
-    // Return to passwords list (replace ADD on the nav stack)
-    fadeOut();
-    navTop = 1;
-    navStack[0] = SCR_HOME;
-    navStack[1] = SCR_LIST;
-    current = SCR_LIST;
+    editingId      = 0;
     listSearchMode = false;
     listQuery[0]   = 0;
-    buildList();
+    homeExitReorder();          // never leave Home in arrange mode
+    navTop      = 0;
+    navStack[0] = SCR_HOME;
+    current     = SCR_HOME;
     drawAll();
-    fadeIn();
     return;
   }
 

@@ -53,7 +53,8 @@ enum Screen {
   SCR_SETTINGS,        // settings list
   SCR_CHGPIN,          // change-PIN flow
   SCR_FLASH,           // flashlight (full white)
-  SCR_WIFI             // WiFi captive-portal import (shows AP credentials)
+  SCR_WIFI,            // WiFi captive-portal import (shows AP credentials)
+  SCR_DEVICES          // saved BLE devices manager (whitelist)
 };
 
 // ── Password record (256 bytes fixed) ─────────────────────────
@@ -88,13 +89,25 @@ static_assert(sizeof(ListItem) == 64, "ListItem must be 64 bytes");
 #define MAX_PASSWORDS   30000
 #define RECORD_SIZE     256
 
+// ── Saved BLE devices (the "whitelist") ──────────────────────
+//  A device the user ACCEPTED once is remembered by its RESOLVED identity
+//  address (stable across the phone's rotating-private-address changes).
+//  On a later reconnect a saved device is auto-approved — no Accept prompt.
+//  Managed on the Devices screen (rename / forget).
+#define MAX_BLE_DEVICES  8
+struct __attribute__((packed)) SavedDevice {
+  char    addr[18];     // identity address "AA:BB:CC:DD:EE:FF"
+  uint8_t addrType;     // NimBLEAddress type (for bond removal)
+  char    name[19];     // user alias (defaults to the address tail)
+};
+
 // ── Settings stored in Preferences (NVS) ──────────────────────
 struct UserSettings {
   uint8_t brightness;       // 20–250
   bool    bleEnabled;
   bool    usbHidEnabled;
-  bool    doubleTapSleep;   // double-tap anywhere → screen off
   char    pin[5];           // 4 digits + null
-  uint8_t autoLockSec;      // 0=off, else 15/30/60/120 s idle → lock
+  uint8_t autoLockSec;      // 0=off, else 15/30/60/120 s idle → re-lock
+                            // (screen stays ON — sleep modes were removed)
   bool    androidFix;       // swap @ / " keycodes for UK/Android BLE hosts
 };

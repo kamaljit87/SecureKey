@@ -2,10 +2,11 @@
 //  screen_settings.ino  —  Settings list
 //
 //  Items (smartwatch-style):
-//    • Bluetooth         (toggle — reboots for clean init order)
+//    • Bluetooth         (toggle — live, no reboot)
+//    • Devices           (saved BLE devices — rename/disconnect/forget)
 //    • USB HID           (toggle)
-//    • 2-Tap Sleep       (toggle)
-//    • Auto-Lock         (value)
+//    • Android           (toggle — @/" keycode swap)
+//    • Auto-Lock         (value — idle re-lock; screen stays on)
 //    • Brightness        (slider, 20–250)
 //    • Change PIN        (action)
 //    • Test HID Now      (action)
@@ -138,9 +139,9 @@ void drawSettings() {
   struct Row { const char *label; uint8_t kind; bool b; uint8_t n; const char *val; };
   Row rows[SET_ROW_COUNT] = {
     {"Bluetooth",       0, settings.bleEnabled,      0, nullptr},
+    {"Devices",         2, false, 0, nullptr},
     {"USB HID",         0, settings.usbHidEnabled,   0, nullptr},
     {"Android",         0, settings.androidFix,      0, nullptr},
-    {"2-Tap Sleep",     0, settings.doubleTapSleep,  0, nullptr},
     {"Auto-Lock",       3, false, 0, autoLockLabel()},
     {"Brightness",      1, false, settings.brightness, nullptr},
     {"Change PIN",      2, false, 0, nullptr},
@@ -387,16 +388,27 @@ void onTapSettings(int16_t tx, int16_t ty) {
     }
     settings.bleEnabled = !settings.bleEnabled;
     bleBlockUntil = 0;                 // a manual toggle clears any block window
+    bleUserPaused = false;             // ...and any Devices-screen pause
     saveSettings();
     if (settings.bleEnabled) {
       hidBleBegin();
     } else {
       bleAuthorized = false;
       hidBleEnd();
-      hidBleForget();        // wipe bonds → turning BLE off then on re-pairs fresh
+      // NOTE: do NOT wipe bonds here. hidBleForget() (deleteAllBonds) used to
+      // run on every toggle-off — it can crash if a peer is still connected,
+      // and it throws away pairings the user wants to keep (and the Phase-2
+      // whitelist depends on). "Forget" is now an explicit action only.
       btConnected = false;
     }
     drawSettings(); return;            // inline flip — no confirmation page
+  }
+  y += step;
+
+  // Devices — manage the saved (auto-approved) Bluetooth devices
+  if (ty >= y && ty < y + SET_ITEM_H) {
+    pushNav(SCR_DEVICES);
+    return;
   }
   y += step;
 
@@ -420,15 +432,8 @@ void onTapSettings(int16_t tx, int16_t ty) {
   }
   y += step;
 
-  // Double-tap sleep toggle
-  if (ty >= y && ty < y + SET_ITEM_H) {
-    settings.doubleTapSleep = !settings.doubleTapSleep;
-    saveSettings();
-    drawSettings(); return;
-  }
-  y += step;
-
-  // Auto-Lock — cycle Off / 15s / 30s / 1m / 2m
+  // Auto-Lock — cycle Off / 15s / 30s / 1m / 2m (idle → re-lock to the PIN
+  // screen with the display ON; sleep-on-idle was removed)
   if (ty >= y && ty < y + SET_ITEM_H) {
     uint8_t c = settings.autoLockSec;
     settings.autoLockSec = (c == 0)  ? 15

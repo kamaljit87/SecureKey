@@ -249,6 +249,10 @@ void onKeyboardSubmit() {
     extern void addNextField();
     addNextField();
   }
+  else if (current == SCR_DEVICES) {
+    extern void devicesRenameSubmit();
+    devicesRenameSubmit();               // save the alias typed on Rename
+  }
 }
 
 void onTapList(int16_t tx, int16_t ty) {

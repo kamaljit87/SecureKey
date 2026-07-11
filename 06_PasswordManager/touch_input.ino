@@ -23,13 +23,51 @@ bool ftReadTouch(uint16_t &x, uint16_t &y) {
   uint8_t yh = Wire.read(), yl = Wire.read();
   x = ((xh & 0x0F) << 8) | xl;
   y = ((yh & 0x0F) << 8) | yl;
+  // Garbage guard: a glitched read can report a "touch" outside the panel
+  // (raw range goes to 4095; the panel is 368×448). Those phantom points
+  // flipped Settings toggles and fired gestures by themselves — reject them.
+  if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return false;
   return true;
 }
 
 void pollTouch() {
   static bool longFired = false;   // long-press already handled this touch?
-  uint16_t x, y;
-  bool active = ftReadTouch(x, y);
+
+  // Self-heal: if the FT3168 stops ACKing its address (wedged by a boot race
+  // or a supply dip), pulse TP_RST to re-init it instead of staying deaf until
+  // a power-cycle. One extra address byte per poll (~25 µs) when healthy.
+  static uint8_t  ftDead = 0;
+  static uint32_t ftQuietUntil = 0;
+  Wire.beginTransmission((uint8_t)FT3168_ADDR);
+  if (Wire.endTransmission() != 0) {
+    if (++ftDead >= 25) {                    // ~0.4 s of consecutive NACKs
+      Serial.println("[TOUCH] FT3168 not ACKing — reset pulse");
+      digitalWrite(TP_RST, LOW);  delay(5);
+      digitalWrite(TP_RST, HIGH); delay(120);
+      ftDead = 0;
+      // The controller recalibrates its capacitive baseline after a reset —
+      // reads during that window are garbage (ghost touches). Stay quiet.
+      ftQuietUntil = millis() + 400;
+    }
+    return;                                  // bus not answering this poll
+  }
+  ftDead = 0;
+  if (millis() < ftQuietUntil) return;       // settling after a reset pulse
+
+  // ── Ghost-touch debounce ──────────────────────────────────
+  // A touch must be present on 2 CONSECUTIVE polls to start, and absent on
+  // 2 consecutive polls to end. A single glitched poll (I2C noise, radio
+  // burst, controller hiccup) used to become a full phantom tap — flipping
+  // Settings toggles, cycling Auto-Lock, firing gestures "by itself".
+  // Costs one poll (~16 ms) of latency; a real finger is far slower.
+  static uint8_t seenDown = 0, seenUp = 0;
+  uint16_t x = 0, y = 0;
+  bool raw = ftReadTouch(x, y);
+  if (raw) { seenUp = 0; if (seenDown < 2) seenDown++; }
+  else     { seenDown = 0; if (seenUp   < 2) seenUp++;  }
+  bool active = touching ? (seenUp < 2) : (seenDown >= 2);
+
+  if (active && touching && !raw) return;    // debounce gap — no fresh coords
 
   if (active && !touching) {
     // ── Touch start ──────────────────────────────────────
@@ -73,6 +111,7 @@ void pollTouch() {
   else if (!active && touching) {
     // ── Touch released ────────────────────────────────────
     touching = false;
+    seenDown = 0; seenUp = 0;      // clean slate for the next touch
     int16_t totalDx = (int16_t)tCurX - (int16_t)tStartX;
     int16_t totalDy = (int16_t)tCurY - (int16_t)tStartY;
 

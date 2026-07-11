@@ -72,6 +72,9 @@ jobs:
           # LE Secure Connections "Just Works" pairing (no passkey IO on this
           # device; sc=true so macOS/iOS also enable HID).
           sed -i 's|setSecurityAuth(true, true, true)|setSecurityAuth(true, false, true)|' "$SRC"
+          # HID Information flags: RemoteWake + NormallyConnectable (0x01 -> 0x03)
+          # so iOS knows we re-advertise when idle and auto-reconnects cleanly.
+          sed -i 's|hidInfo(0x00, 0x01)|hidInfo(0x00, 0x03)|' "$SRC"
 
       - name: Compile firmware
         run: |

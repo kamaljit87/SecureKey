@@ -47,10 +47,17 @@ extern "C" {
   int  hidBleStarted();
   void hidBleSetAndroidFix(int on);   // UK/Android @<->" keycode swap
   void hidBlePeerAddr(char *out, int n);   // connecting peer's BT address
+  int  hidBlePeerIdAddr(char *out, int n, int *type);  // 1=bonded/stable id
+  int  hidBleCapturePeer(char *ota, int otaN, char *id, int idN,
+                         int *type, int *bonded);       // one-shot peer snapshot
+  void hidBleForgetOne(const char *addr, int type);    // delete one bond
   void hidBleSettleReset();           // re-arm typing settle on disconnect
   void hidBleTune();                  // request tight conn interval at connect
+  void hidBleTuneCached();            // same, but by cached handle (no list copy)
+  void hidBleDisconnectCached();      // disconnect by cached handle (no list copy)
   void hidBleForget();                // clear all BLE bonds (re-pair fresh)
   void hidBleDisconnectPeer();        // kick current peer, keep advertising
+  void hidBleReadvertise();           // restart advertising after a disconnect
   void hidBleReturn();                // send Return key over BLE
   void hidUsbReturn();                // send Return key over USB
 }
@@ -63,8 +70,7 @@ extern "C" {
 #include <Preferences.h>
 #include "pin_config.h"
 #include "theme.h"
-#include "esp_sleep.h"
-#include "driver/rtc_io.h"
+#include "esp_system.h"     // esp_reset_reason() — logged at boot
 
 // HID transports are isolated to hid_usb.cpp / hid_ble.cpp — see above
 
@@ -97,6 +103,78 @@ uint32_t bleBlockUntil  = 0;             // millis() until which this peer is si
 uint32_t bleGateSnooze  = 0;            // after REJECT: don't re-prompt before this
 char     bleBlockedAddr[24] = {0};       // MAC of the specifically blocked peer
 
+// Saved BLE devices ("whitelist"): devices the user accepted once are
+// remembered by identity address and auto-approved on reconnect — no
+// repeated Accept prompt. Managed on the Devices screen (Settings → Devices).
+SavedDevice savedDevs[MAX_BLE_DEVICES];
+uint8_t     savedDevCount = 0;
+
+// Cached identity of the currently-connected BLE peer. Updated ONCE per BLE
+// manager tick from the main loop; the Devices screen and auto-approve read
+// these instead of calling NimBLE per-draw (which raced the NimBLE core-0 task
+// and reset the device whenever the Devices screen was open).
+char        connPeerId[18]  = {0};   // resolved identity, or "" if none/unbonded
+char        connPeerOta[24] = {0};   // over-the-air address (for the gate display)
+int         connPeerType    = 0;
+bool        connPeerBonded  = false;
+bool        connPeerCaptured = false; // got a snapshot for this connection?
+
+// User pressed DISCONNECT on the Devices screen: BLE is fully PAUSED — link
+// dropped AND advertising stopped — until they press CONNECT. Pausing the
+// radio (instead of kicking the phone every time it auto-reconnects, as the
+// old per-device pause did) is what keeps iOS sane: the kick-on-reconnect
+// loop made the phone flap — "connected" in its settings, typed nothing,
+// dropped, retried — until the user had to Forget the device. RAM-only;
+// cleared by CONNECT, the Bluetooth toggle, or a reboot.
+bool        bleUserPaused = false;
+
+void devsSave() {
+  prefs.begin("skset", false);
+  prefs.putBytes("devs", savedDevs, (size_t)savedDevCount * sizeof(SavedDevice));
+  prefs.end();
+}
+void devsLoad() {
+  prefs.begin("skset", true);
+  size_t n = prefs.getBytesLength("devs");
+  savedDevCount = 0;
+  if (n > 0 && n % sizeof(SavedDevice) == 0 && n <= sizeof(savedDevs)) {
+    prefs.getBytes("devs", savedDevs, n);
+    savedDevCount = (uint8_t)(n / sizeof(SavedDevice));
+  }
+  prefs.end();
+}
+int devsFind(const char *addr) {
+  for (uint8_t i = 0; i < savedDevCount; i++)
+    if (strcasecmp(savedDevs[i].addr, addr) == 0) return i;
+  return -1;
+}
+void devsAdd(const char *addr, int type) {
+  if (!addr || !addr[0] || strcmp(addr, "unknown") == 0) return;
+  if (devsFind(addr) >= 0) return;                  // already saved
+  if (savedDevCount >= MAX_BLE_DEVICES) {           // full → drop the oldest
+    memmove(&savedDevs[0], &savedDevs[1],
+            (MAX_BLE_DEVICES - 1) * sizeof(SavedDevice));
+    savedDevCount = MAX_BLE_DEVICES - 1;
+  }
+  SavedDevice &d = savedDevs[savedDevCount++];
+  memset(&d, 0, sizeof(d));
+  strncpy(d.addr, addr, sizeof(d.addr) - 1);
+  d.addrType = (uint8_t)type;
+  // Default alias: "Device EE:FF" (address tail) until the user renames it.
+  const char *tail = strlen(addr) >= 5 ? addr + strlen(addr) - 5 : addr;
+  snprintf(d.name, sizeof(d.name), "Device %s", tail);
+  devsSave();
+  Serial.printf("[BLE] saved device %s as '%s'\n", d.addr, d.name);
+}
+void devsRemove(uint8_t idx) {
+  if (idx >= savedDevCount) return;
+  hidBleForgetOne(savedDevs[idx].addr, savedDevs[idx].addrType);
+  memmove(&savedDevs[idx], &savedDevs[idx + 1],
+          (size_t)(savedDevCount - idx - 1) * sizeof(SavedDevice));
+  savedDevCount--;
+  devsSave();
+}
+
 // PIN
 char     pinEntry[5] = {0};
 uint8_t  pinLen      = 0;
@@ -128,14 +206,15 @@ uint16_t  editingId = 0;     // 0 = adding new
 
 // User settings (loaded from NVS) — USB HID defaults ON so typing works
 // out-of-the-box when plugged into a PC.
-UserSettings settings = { 140, false, true, true, "1234", 30, false };
+UserSettings settings = { 140, false, true, "1234", 30, false };
 
 // Idle tracking for auto-lock (refreshed on every touch in pollTouch)
 uint32_t   lastActivityMs = 0;
 
-// Double-tap sleep state
+// Screen-off state (side button only — automated sleep modes were removed:
+// idle light-sleep / double-tap sleep read as "touch randomly stops working"
+// in QA, because the dark panel + double-tap-to-wake looked like dead touch).
 bool       screenOff   = false;
-uint32_t   lastTapTime = 0;
 
 // LED helper
 uint32_t  ledClearAt = 0;
@@ -162,11 +241,12 @@ void detailInit();
 void drawSettings();void onTapSettings(int16_t,int16_t);
 void drawChgPin();    void onTapChgPin(int16_t,int16_t);    void chgPinInit();
 void drawFlash();     void onTapFlash(int16_t,int16_t);
+void drawDevices();   void onTapDevices(int16_t,int16_t);   void devicesInit();
 void drawAll();
 void drawStatusBar();
 void pollTouch();
 void popToLock();
-void lightSleep();   void enterDeepSleep();   void powerOff();
+void screenSleep();
 
 // gfx_lib helpers used here
 void textCenter(int16_t y, const char *s, uint8_t sz,
@@ -209,42 +289,17 @@ void drawAll() {
     case SCR_CHGPIN:      drawChgPin();    break;
     case SCR_FLASH:       drawFlash();     break;
     case SCR_WIFI:        drawWifi();      break;
+    case SCR_DEVICES:     drawDevices();   break;
     default:                               break;
   }
 }
 
 void dispatchTap(int16_t tx, int16_t ty) {
-  static int16_t lastTapX = -999, lastTapY = -999;
-  uint32_t now = millis();
-  if (screenOff) {
-    // Device is OFF (light sleep). A SINGLE tap must NOT wake it — only a
-    // double-tap (when 2-Tap Sleep is on) or the side button. Track taps and
-    // wake on the 2nd quick one in roughly the same spot.
-    static uint32_t offTapMs = 0;
-    static int16_t  offTapX = -999, offTapY = -999;
-    bool sameSpot = (abs(tx - offTapX) < 40 && abs(ty - offTapY) < 40);
-    if (settings.doubleTapSleep && sameSpot && (now - offTapMs) < 400) {
-      out->Display_Brightness(settings.brightness);
-      screenOff = false;
-      offTapMs = 0; offTapX = -999; offTapY = -999;
-    } else {
-      offTapMs = now; offTapX = tx; offTapY = ty;   // 1st tap — wait for the 2nd
-    }
-    return;
-  }
-  // Double-tap sleep: only on passive list-style screens, AND only when both
-  // taps land in nearly the same spot — so tapping two different items (or a
-  // quick double-tap to open something) never accidentally sleeps the device.
-  bool sleepAllowed = (current == SCR_HOME || current == SCR_LIST ||
-                       current == SCR_SETTINGS);
-  bool sameSpot = (abs(tx - lastTapX) < 36 && abs(ty - lastTapY) < 36);
-  if (settings.doubleTapSleep && sleepAllowed && sameSpot &&
-      (now - lastTapTime) < 280) {
-    lastTapTime = 0; lastTapX = -999; lastTapY = -999;
-    lightSleep();        // BLE off + panel dark; double-tap or button wakes
-    return;
-  }
-  lastTapTime = now; lastTapX = tx; lastTapY = ty;
+  // Screen OFF (side button): ignore ALL touch. The touch controller stays
+  // powered (so it can't wedge like it did coming out of light sleep), but
+  // this software gate means a pocket/skin contact can never register —
+  // only the side button turns the screen back on.
+  if (screenOff) return;
 
   switch (current) {
     case SCR_LOCK:        onTapLock(tx, ty);       break;
@@ -257,6 +312,7 @@ void dispatchTap(int16_t tx, int16_t ty) {
     case SCR_CHGPIN:      onTapChgPin(tx, ty);     break;
     case SCR_FLASH:       onTapFlash(tx, ty);      break;
     case SCR_WIFI:        onTapWifi(tx, ty);       break;
+    case SCR_DEVICES:     onTapDevices(tx, ty);    break;
     default:                                       break;
   }
 }
@@ -276,6 +332,7 @@ void pushNav(Screen s) {
                            listSearchMode = false; listQuery[0] = 0; buildList(); }
   if (s == SCR_DETAIL)   { detailInit(); }
   if (s == SCR_SETTINGS) { extern int32_t settingsScrollY; settingsScrollY = 0; }
+  if (s == SCR_DEVICES)  { devicesInit(); }
   if (s == SCR_PIN)      { pinSlideIn(); return; }   // animated slide-up
   drawAll();
 }
@@ -311,17 +368,14 @@ void onDrag(uint16_t cx, uint16_t cy, int16_t dx, int16_t dy) {
 }
 
 void onSwipeEnd(int16_t totalDx, int16_t totalDy) {
+  (void)totalDx;
   // Swipe UP on lock → PIN
   if (current == SCR_LOCK && totalDy < -50) { pushNav(SCR_PIN); return; }
   // Swipe DOWN on PIN → lock
   if (current == SCR_PIN  && totalDy >  60) { popNav(); return; }
-  // Swipe RIGHT (back) — require a deliberate, clearly-horizontal gesture so
-  // it doesn't fire on small drifts or during vertical scrolling.
-  if (current != SCR_LOCK && current != SCR_PIN &&
-      totalDx > 110 && totalDx > abs(totalDy) * 2) {
-    popNav();
-    return;
-  }
+  // Swipe-right "go back" gesture REMOVED (by request): ghost/mis-touch drags
+  // kept popping screens "by themselves". Every screen has an explicit back
+  // arrow — that is now the only way back.
   // Inertia on lists
   if (current == SCR_LIST || current == SCR_SEARCH_RES) {
     listVelocity = -(float)totalDy * 0.06f;
@@ -447,7 +501,9 @@ void bleConnectGate() {
 
   // Show the connecting peer's Bluetooth address (a central does not send a
   // friendly name, so the MAC is the most we can show).
-  char paddr[24]; hidBlePeerAddr(paddr, sizeof(paddr));
+  // Use the CACHED address (captured once per connection by the loop) — no
+  // NimBLE list query here, which is what was crashing the device.
+  const char *paddr = connPeerOta[0] ? connPeerOta : "unknown";
   char pline[40]; snprintf(pline, sizeof(pline), "Device: %s", paddr);
   textCenter(STATUS_H + 136, pline, 1, C_BLUE);
 
@@ -498,10 +554,29 @@ void bleConnectGate() {
     bleAuthorized = true;
     ledSet(0x00FF00, 250);
     Serial.println("[BLE] connection ACCEPTED by user");
+    // Remember this device so it's auto-approved next time — but ONLY once
+    // bonding has resolved a STABLE identity. Saving before that stored the
+    // phone's rotating private address, which never matched on reconnect
+    // ("shows a new device every time"). Bonding usually completes within a
+    // second, so re-snapshot briefly for a bonded identity. This is a calm
+    // moment (gate is blocking, no redraws), so the single query is safe.
+    char ota[24], idAddr[18]; int idType = 0, bonded = 0;
+    for (int tries = 0; tries < 20; tries++) {          // up to ~2 s
+      hidBleCapturePeer(ota, sizeof(ota), idAddr, sizeof(idAddr), &idType, &bonded);
+      if (bonded) break;
+      delay(100);
+    }
+    if (bonded) {
+      devsAdd(idAddr, idType);
+      strncpy(connPeerId, idAddr, sizeof(connPeerId) - 1); connPeerId[sizeof(connPeerId) - 1] = 0;
+      connPeerBonded = true;
+    } else Serial.println("[BLE] not bonded yet — not saved (accepted for now)");
   } else if (choice == 2) {                  // BLOCK 5 min
     bleAuthorized = false;
     bleBlockUntil = millis() + 300000UL;     // this MAC silently kicked for 5 min
-    hidBlePeerAddr(bleBlockedAddr, sizeof(bleBlockedAddr));
+    strncpy(bleBlockedAddr, connPeerOta[0] ? connPeerOta : "unknown",
+            sizeof(bleBlockedAddr) - 1);
+    bleBlockedAddr[sizeof(bleBlockedAddr) - 1] = 0;
     hidBleDisconnectPeer();                  // kick only this peer, BLE keeps advertising
     ledSet(0xFF0000, 250);
     Serial.printf("[BLE] BLOCKED %s for 5 min (BLE still up for other devices)\n", bleBlockedAddr);
@@ -569,7 +644,6 @@ void loadSettings() {
   settings.brightness     = prefs.getUChar("br",   140);
   settings.bleEnabled     = prefs.getBool ("ble",  false);
   settings.usbHidEnabled  = prefs.getBool ("usb",  true);
-  settings.doubleTapSleep = prefs.getBool ("dtap", true);
   settings.autoLockSec    = prefs.getUChar("alock", 30);
   settings.androidFix     = prefs.getBool ("afix", false);
   pinFails                = prefs.getUChar("pinf",  0);
@@ -584,18 +658,52 @@ void saveSettings() {
   prefs.putUChar ("br",   settings.brightness);
   prefs.putBool  ("ble",  settings.bleEnabled);
   prefs.putBool  ("usb",  settings.usbHidEnabled);
-  prefs.putBool  ("dtap", settings.doubleTapSleep);
   prefs.putUChar ("alock", settings.autoLockSec);
   prefs.putBool  ("afix", settings.androidFix);
   prefs.putString("pin",  settings.pin);
   prefs.end();
 }
 
+// ── Boot reset-reason (for the "random auto-restart" QA bug) ──────────
+esp_reset_reason_t bootRR = ESP_RST_UNKNOWN;
+const char *bootRRStr() {
+  switch (bootRR) {
+    case ESP_RST_POWERON:  return "POWERON";
+    case ESP_RST_SW:       return "SW_RESTART";
+    case ESP_RST_PANIC:    return "PANIC";
+    case ESP_RST_INT_WDT:  return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT:      return "WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    default:               return "OTHER";
+  }
+}
+// True for resets we didn't ask for (brownout / crash / watchdog) — the ones
+// worth flagging on-screen. A clean power-on or an intentional ESP.restart()
+// (factory reset) are expected, so we stay quiet for those.
+static bool bootWasAbnormal() {
+  return bootRR == ESP_RST_BROWNOUT || bootRR == ESP_RST_PANIC ||
+         bootRR == ESP_RST_INT_WDT  || bootRR == ESP_RST_TASK_WDT ||
+         bootRR == ESP_RST_WDT;
+}
+
 // ── Setup ────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  // Native USB-CDC (USB Mode = OTG/TinyUSB) only accepts bytes once the host
+  // has re-attached after a reset — without this wait the early boot log
+  // (incl. the reset-reason line below) is transmitted into the void and lost.
+  // Bounded so an UNmonitored boot only pauses briefly.
+  for (uint32_t t = millis(); !Serial && millis() - t < 1500; ) delay(10);
   delay(100);
   Serial.println("\n[SecureKey] Password Manager (mono) starting...");
+
+  // Capture WHY we booted — the key clue for the "random auto-restart" QA bug.
+  // Surfaced on serial AND on-screen (below) so brownout vs crash is visible
+  // even on battery with no cable attached.
+  bootRR = esp_reset_reason();
+  Serial.printf("[BOOT] reset reason: %s (%d)\n", bootRRStr(), (int)bootRR);
 
   led.begin();  led.setBrightness(40);  led.clear(); led.show();
 
@@ -632,6 +740,7 @@ void setup() {
   if (hidUsbCompiled()) hidUsbBegin();
 
   loadSettings();
+  devsLoad();                      // restore the saved BLE devices whitelist
   homeLoadOrder();                 // restore the user's home tile arrangement
 
   // Re-arm the PIN lockout across power cycles. millis() resets on reboot, so
@@ -645,15 +754,32 @@ void setup() {
   if (settings.brightness < 20) { settings.brightness = 140; saveSettings(); }
   out->Display_Brightness(settings.brightness);
 
-  // Boot splash plays only on a true power-on / reset. When we woke from deep
-  // sleep (side button), skip it and come up dark, straight to the lock screen.
-  bool fromDeepSleep = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED);
-  if (fromDeepSleep) out->Display_Brightness(0);
-  else               bootRevealIn();
+  // Boot splash. (Deep sleep was removed — every boot is a true power-on /
+  // reset now, so the splash always plays.)
+  bootRevealIn();
   uint32_t bootSplashMs = millis();
 
   Wire.begin(IIC_SDA, IIC_SCL, 400000);
   pinMode(USER_BTN_PIN, INPUT_PULLUP);
+
+  // FT3168 warm-up: fresh out of reset the touch controller can stay silent
+  // on I2C for a moment, which read as "touch dead for the first second after
+  // boot". Wait (max ~600 ms) until it ACKs its address; if it never does,
+  // pulse TP_RST once and give it time to calibrate. Runs before the boot
+  // splash, so it costs no visible time.
+  {
+    bool ack = false;
+    for (uint32_t t0 = millis(); millis() - t0 < 600 && !ack; ) {
+      Wire.beginTransmission((uint8_t)FT3168_ADDR);
+      ack = (Wire.endTransmission() == 0);
+      if (!ack) delay(25);
+    }
+    if (!ack) {
+      digitalWrite(TP_RST, LOW);  delay(8);
+      digitalWrite(TP_RST, HIGH); delay(150);
+    }
+    Serial.printf("[TOUCH] FT3168 %s\n", ack ? "ready" : "reset-pulsed");
+  }
 
   Serial.printf("[MEM] PSRAM free: %u\n", ESP.getFreePsram());
   passwordIndex = (ListItem *)ps_malloc(MAX_PASSWORDS * sizeof(ListItem));
@@ -678,17 +804,29 @@ void setup() {
   }
 
   // Keep the logo a beat (it's been up during init), play the booting dots,
-  // then power-down fade. Skipped entirely on a deep-sleep wake.
-  if (!fromDeepSleep) {
-    while (millis() - bootSplashMs < 250) delay(10);
-    bootDots(1800);
-    bootFadeOut();
-  }
+  // then power-down fade.
+  while (millis() - bootSplashMs < 250) delay(10);
+  bootDots(1800);
+  bootFadeOut();
 
   // Draw the UI immediately so the screen is always visible, even if BLE
   // has trouble coming up below.
   drawAll();
   out->Display_Brightness(settings.brightness);
+
+  // If the last boot was NOT something we asked for (brownout / crash /
+  // watchdog), flag it on-screen for a couple seconds. This makes the
+  // "random auto-restart" bug diagnosable on battery with no serial cable:
+  // BROWNOUT = power/supply, PANIC/WDT = firmware crash.
+  if (bootWasAbnormal()) {
+    char msg[40];
+    snprintf(msg, sizeof(msg), "LAST RESET: %s", bootRRStr());
+    gfx->fillRect(0, LCD_HEIGHT - 34, LCD_WIDTH, 34, C_BLACK);
+    textCenter(LCD_HEIGHT - 24, msg, 1, C_RED);
+    flushScreen();
+    delay(2500);
+    drawAll();                       // repaint clean
+  }
 
   // BLE LAST — after the screen is up, so a BLE init hiccup/brownout can't
   // leave you staring at a black screen.  RECOVERY: hold the side button
@@ -704,10 +842,12 @@ void setup() {
   }
 }
 
-// ── Power / sleep ─────────────────────────────────────────────────────
-// Light sleep: lock, drop BLE, dark panel — but the MCU + touch stay on so a
-// double-tap (when 2-Tap Sleep is on) or the side button wakes it quickly.
-void lightSleep() {
+// ── Power / screen off ───────────────────────────────────────────────
+// Side-button screen off: lock, drop BLE, dark panel. The MCU and the touch
+// controller STAY powered — deep/light sleep were removed because waking
+// through them left the FT3168 wedged ("touch randomly stops working" in QA).
+// All touch is ignored while off (see dispatchTap); only the button wakes.
+void screenSleep() {
   homeExitReorder();
   navTop = 0; navStack[0] = SCR_LOCK; current = SCR_LOCK; pinLen = 0;
   drawAll();
@@ -717,30 +857,6 @@ void lightSleep() {
   led.clear(); led.show(); ledClearAt = 0;
   out->Display_Brightness(0);
   screenOff = true;
-}
-
-// Deep sleep: everything off (BLE, LED, panel) — lowest power. Only the side
-// button (GPIO8) wakes it, and waking re-boots (setup() skips the splash).
-void enterDeepSleep() {
-  Serial.println("[PWR] deep sleep — button-only wake");
-  if (settings.bleEnabled && hidBleCompiled()) hidBleEnd();
-  led.clear(); led.show();
-  out->Display_Brightness(0);
-  digitalWrite(LCD_EN, LOW);                              // cut panel power
-  delay(20);
-  while (digitalRead(USER_BTN_PIN) == LOW) delay(10);     // wait for release
-  delay(60);
-  rtc_gpio_pullup_en((gpio_num_t)USER_BTN_PIN);
-  rtc_gpio_pulldown_dis((gpio_num_t)USER_BTN_PIN);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);  // wake on press (LOW)
-  esp_deep_sleep_start();                                 // does not return
-}
-
-// The side button's "power off": deep sleep for max battery, or light sleep if
-// 2-Tap Sleep is on (so a double-tap can wake it too).
-void powerOff() {
-  if (settings.doubleTapSleep) lightSleep();
-  else                         enterDeepSleep();
 }
 
 // ── Loop ─────────────────────────────────────────────────────────────
@@ -792,19 +908,18 @@ void loop() {
     }
   }
 
-  // SW2 physical → power button. Press to turn the device OFF (locked + dark).
-  // 2-Tap Sleep ON → light sleep (a double-tap or the button wakes it). 2-Tap
-  // OFF → DEEP sleep: BLE/LED/panel all off, button-only wake, max battery.
-  // (Deep sleep wakes by re-booting, but setup() skips the splash on wake.)
+  // SW2 physical → screen on/off toggle. Press to turn the screen OFF
+  // (locked + dark, touch ignored); press again to turn it back ON.
+  // This is the ONLY sleep-like mode left — no idle sleep, no double-tap.
   static bool btnLast = HIGH;
   bool btnNow = digitalRead(USER_BTN_PIN);
   if (btnLast == HIGH && btnNow == LOW) {
     if (screenOff) {
-      // Light-sleep wake (the side button always wakes).
       out->Display_Brightness(settings.brightness);
       screenOff = false;
+      lastActivityMs = millis();     // fresh idle window on wake
     } else {
-      powerOff();        // deep or light sleep per the 2-Tap setting
+      screenSleep();
     }
   }
   btnLast = btnNow;
@@ -830,37 +945,115 @@ void loop() {
     lastBleMs = millis();
 
     if (hidBleCompiled()) {
-      // Advertise whenever BLE is enabled AND the device is awake. In sleep
-      // (screenOff) BLE is forced off to save battery; it resumes on wake.
-      bool wantBle = settings.bleEnabled && !screenOff;
+      // Advertise whenever BLE is enabled AND the device is awake AND the
+      // user hasn't paused it from the Devices screen. In sleep (screenOff)
+      // BLE is forced off to save battery; it resumes on wake.
+      bool wantBle = settings.bleEnabled && !screenOff && !bleUserPaused;
       if (wantBle && !hidBleStarted())  hidBleBegin();
       if (!wantBle && hidBleStarted()) { hidBleEnd(); bleAuthorized = false; }
     }
 
     static uint32_t connRisingAt = 0;
+    static bool     connTuned    = false;
     bool nowConn = settings.bleEnabled && hidBleCompiled() && hidBleConnected();
     if (nowConn && !btConnected) {                          // rising edge
       connRisingAt = millis();
-      hidBleTune();        // pin a tight interval now, well before typing
+      connTuned = false;   // (re)tune once we've safely captured the handle
+      // NOTE: no hidBleTune() here anymore — it copied the connection list at
+      // the connect instant (peak churn), a reset source. We tune by cached
+      // handle right after the capture below instead.
     }
     if (nowConn != btConnected) {
+      if (btConnected && !nowConn) {
+        // Disconnect edge: give a quiet window so a phone that auto-reconnects
+        // the instant it drops can't immediately re-fire the Accept gate
+        // ("requests keep coming"). A deliberate re-pair still works after 3 s.
+        bleGateSnooze = millis() + 3000;
+      }
       btConnected = nowConn;
-      if (current != SCR_FLASH) { drawStatusBar(); flushScreen(); }
+      if (current == SCR_DEVICES)      drawAll();   // live card/list update
+      else if (current != SCR_FLASH) { drawStatusBar(); flushScreen(); }
     }
-    if (!nowConn) { bleAuthorized = false; hidBleSettleReset(); }  // peer dropped
+    if (!nowConn) {                        // peer dropped (or never connected)
+      bleAuthorized = false;
+      hidBleSettleReset();
+      // NimBLE re-advertises itself on disconnect (advertiseOnDisconnect) — no
+      // manual restart needed here anymore.
+    }
+
+    // Snapshot the connected peer into the cache. We query NimBLE's connection
+    // list ONLY until we've captured a bonded identity, and at most for the
+    // first ~5 s after connecting — after that we never touch the list again
+    // for this connection. Everything else (gate, auto-approve, Devices screen,
+    // block check) reads the cached strings. This is the fix for the random
+    // PANIC: getPeerDevices() copies a vector the BLE core mutates on
+    // connect/disconnect, so calling it constantly (per redraw) eventually
+    // read freed memory and reset the device. Steady state now = zero reads.
+    if (nowConn) {
+      // Keep snapshotting only for the first 8 s of a connection, and stop
+      // early once we have a bonded identity. After that: never query again.
+      bool tryCapture = (millis() - connRisingAt < 8000) && !connPeerBonded;
+      if (tryCapture) {
+        char ota[24], id[18]; int t = 0, b = 0;
+        if (hidBleCapturePeer(ota, sizeof(ota), id, sizeof(id), &t, &b)) {
+          strncpy(connPeerOta, ota, sizeof(connPeerOta) - 1); connPeerOta[sizeof(connPeerOta) - 1] = 0;
+          strncpy(connPeerId,  id,  sizeof(connPeerId)  - 1); connPeerId[sizeof(connPeerId)   - 1] = 0;
+          connPeerType   = t;
+          connPeerBonded = b ? true : false;
+          connPeerCaptured = true;
+          if (!connTuned) { hidBleTuneCached(); connTuned = true; }  // safe: by handle
+        }
+      }
+    } else {
+      connPeerId[0] = 0; connPeerOta[0] = 0;
+      connPeerBonded = false; connPeerType = 0; connPeerCaptured = false;
+      connTuned = false;
+    }
 
     // Only prompt once the link has been STABLE for a moment — early in a BLE
     // connection the link can briefly flap (pairing/bonding handshake), and
     // prompting on that flap made the Accept page flash then re-appear.
     bool stable = nowConn && (millis() - connRisingAt > 900);
+
+    // Saved-device auto-approve: a device the user ACCEPTED before (matched by
+    // its stable BONDED identity) skips the gate entirely — connect and type,
+    // no prompt. To stop a saved device, use Settings → Devices → Disconnect /
+    // Forget.
+    if (stable && !bleAuthorized && connPeerBonded && connPeerId[0]) {
+      if (devsFind(connPeerId) >= 0) {
+        bleAuthorized = true;
+        ledSet(0x00FF00, 200);
+        Serial.printf("[BLE] auto-approved saved device %s\n", connPeerId);
+        if (current != SCR_FLASH) { drawStatusBar(); flushScreen(); }
+        if (current == SCR_DEVICES) drawAll();   // live status on the screen
+      }
+    }
+
+    // Ghost-link watchdog: connected for 20+ s but NEVER encrypted. Classic
+    // bond mismatch — e.g. we forgot the device but the phone still holds its
+    // old keys: its reconnect "succeeds" at link level (phone shows connected)
+    // but encryption/HID never come up, so typing goes nowhere. Kick it so the
+    // phone fails cleanly and can re-pair fresh instead of ghosting forever.
+    if (nowConn && !connPeerBonded && (millis() - connRisingAt) > 20000UL) {
+      Serial.println("[BLE] link never encrypted in 20s — kicking ghost link");
+      hidBleDisconnectCached();
+    }
+
+    // Only show the Accept gate once we've actually IDENTIFIED the peer —
+    // captured + bonded, or the 8 s capture window elapsed. This gives the
+    // saved-device auto-approve above first chance, so a known device no longer
+    // occasionally flashes the request before its identity resolves.
+    bool identified = connPeerCaptured &&
+                      (connPeerBonded || (millis() - connRisingAt > 8000));
     bool unlocked = (current != SCR_LOCK && current != SCR_PIN);
-    if (stable && !bleAuthorized && unlocked && !screenOff && millis() >= bleGateSnooze) {
+    if (stable && identified && !bleAuthorized && unlocked && !screenOff &&
+        millis() >= bleGateSnooze) {
       // If this is the specifically blocked MAC and the block window hasn't
       // expired, silently kick it — no prompt, BLE stays up for other devices.
       if (millis() < bleBlockUntil && bleBlockedAddr[0]) {
-        char curAddr[24]; hidBlePeerAddr(curAddr, sizeof(curAddr));
-        if (strcmp(curAddr, bleBlockedAddr) == 0) {
-          hidBleDisconnectPeer();   // silent kick, no gate shown
+        // Compare against the CACHED address (no NimBLE query in this hot path).
+        if (connPeerOta[0] && strcmp(connPeerOta, bleBlockedAddr) == 0) {
+          hidBleDisconnectCached(); // silent kick by handle (repeats — no list copy)
         } else {
           bleConnectGate();         // different device — show normal gate
         }
@@ -880,11 +1073,16 @@ void loop() {
   // Auto-lock after idle (security). Skipped on lock/PIN, and on the
   // flashlight + WiFi-import (no vault list shown, and they shouldn't be
   // interrupted while in use).
+  // NOTE: this only collapses to the LOCK screen — the display stays ON and
+  // touch stays live. It used to lightSleep() here, which darkened the panel
+  // and gated wake on a double-tap: in QA that read as "touch randomly stops
+  // working during idle" (Bug 3). BLE also stays up, so an idle lock no
+  // longer kills an accepted connection.
   if (settings.autoLockSec > 0 && !screenOff &&
       current != SCR_LOCK && current != SCR_PIN &&
       current != SCR_FLASH && current != SCR_WIFI &&
       (millis() - lastActivityMs) > (uint32_t)settings.autoLockSec * 1000UL) {
-    lightSleep();     // lock + BLE off + panel dark; double-tap or button wakes
+    popToLock();
   }
 
   delay(1);
