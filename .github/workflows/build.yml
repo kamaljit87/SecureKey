@@ -222,9 +222,6 @@ jobs:
             build/06_PasswordManager.ino.partitions.bin \
             firmware/06_PasswordManager.ino.partitions.bin
 
-          cp \
-            build/boot_app0.bin \
-            firmware/boot_app0.bin
 
           echo "Updated firmware:"
           ls -lah firmware
