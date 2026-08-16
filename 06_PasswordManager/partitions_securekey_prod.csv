@@ -1,0 +1,20 @@
+# SecureKey — PRODUCTION partition table (for use WITH NVS Encryption)
+#
+# Based on the stock "app3M_fat9M_16MB" scheme this project already uses,
+# with one addition: a small "nvs_keys" partition, which NVS Encryption
+# requires to store the (flash-encryption-protected) XTS keys that encrypt
+# the "skcrypt"/"skset" NVS namespaces at rest.
+#
+# This file is NOT used by default. It only matters if you follow the
+# PRODUCTION flash-encryption steps in docs/SECURITY.md — see "Enabling
+# NVS Encryption" there. Development builds keep using the existing
+# Tools > Partition Scheme picker (app3M_fat9M_16MB) unchanged.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+nvs_keys,   data, nvs_keys, 0x10000,  0x1000,   encrypted
+app0,       app,  ota_0,    0x20000,  0x300000,
+app1,       app,  ota_1,    0x320000, 0x300000,
+ffat,       data, fat,      0x620000, 0x9D0000,
+coredump,   data, coredump, 0xFF0000, 0x10000,

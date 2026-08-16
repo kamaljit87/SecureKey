@@ -71,6 +71,15 @@ extern "C" {
 #include "pin_config.h"
 #include "theme.h"
 #include "esp_system.h"     // esp_reset_reason() — logged at boot
+#include "crypto_core.h"    // PBKDF2 / AES-256-GCM / CSPRNG / secure-wipe wrappers
+#include "shared_types.h"      // encrypted-DB on-disk layout + SECURITY_VERSION
+
+// vault_crypto.ino's vaultPinLength() is used a few lines below (in
+// pinRefreshLength()) — earlier than Arduino's auto-generated function
+// prototypes get inserted, so it needs an explicit forward declaration up
+// here rather than relying on the (correctly, but too-late-positioned)
+// one further down with the rest of this file's forward declarations.
+uint8_t vaultPinLength();
 
 // HID transports are isolated to hid_usb.cpp / hid_ble.cpp — see above
 
@@ -164,7 +173,7 @@ void devsAdd(const char *addr, int type) {
   const char *tail = strlen(addr) >= 5 ? addr + strlen(addr) - 5 : addr;
   snprintf(d.name, sizeof(d.name), "Device %s", tail);
   devsSave();
-  Serial.printf("[BLE] saved device %s as '%s'\n", d.addr, d.name);
+  SK_LOG("[BLE] saved device %s as '%s'\n", d.addr, d.name);
 }
 void devsRemove(uint8_t idx) {
   if (idx >= savedDevCount) return;
@@ -175,11 +184,20 @@ void devsRemove(uint8_t idx) {
   devsSave();
 }
 
-// PIN
-char     pinEntry[5] = {0};
+// PIN — buffer sized for PIN_MAX_LEN (8) digits + NUL. The PIN itself
+// never touches NVS/Preferences; see vault_crypto.ino. This buffer is
+// wiped with ckSecureZero() after every unlock/setup/change attempt.
+char     pinEntry[PIN_MAX_LEN + 1] = {0};
 uint8_t  pinLen      = 0;
 uint32_t shakeUntil  = 0;
 uint32_t unlockUntil = 0;
+
+// Cached configured PIN length (how many digits the keypad should collect
+// before auto-submitting) — refreshed from NVS metadata at boot / after
+// a PIN change. See vaultPinLength()/vaultSetPinLength() in vault_crypto.ino.
+uint8_t  cachedPinLen = PIN_MIN_LEN;
+uint8_t  pinDisplayLen() { return cachedPinLen; }
+void     pinRefreshLength() { cachedPinLen = vaultPinLength(); }
 
 // PIN brute-force lockout (escalating wait after repeated wrong PINs)
 uint8_t  pinFails     = 0;       // cumulative wrong attempts (persisted)
@@ -205,8 +223,8 @@ uint16_t  detailId  = 0;     // currently shown
 uint16_t  editingId = 0;     // 0 = adding new
 
 // User settings (loaded from NVS) — USB HID defaults ON so typing works
-// out-of-the-box when plugged into a PC.
-UserSettings settings = { 140, false, true, "1234", 30, false };
+// out-of-the-box when plugged into a PC. No PIN field here — see theme.h.
+UserSettings settings = { 140, false, true, 30, false };
 
 // Idle tracking for auto-lock (refreshed on every touch in pollTouch)
 uint32_t   lastActivityMs = 0;
@@ -242,7 +260,15 @@ void drawSettings();void onTapSettings(int16_t,int16_t);
 void drawChgPin();    void onTapChgPin(int16_t,int16_t);    void chgPinInit();
 void drawFlash();     void onTapFlash(int16_t,int16_t);
 void drawDevices();   void onTapDevices(int16_t,int16_t);   void devicesInit();
+void drawSetupPin();  void onTapSetupPin(int16_t,int16_t);
+void drawMigrate();   void onTapMigrate(int16_t,int16_t);
 void drawAll();
+
+// pwgen.ino (password generator, HW RNG) is textually ordered before
+// screen_add.ino in Arduino's alphabetical file concatenation, so its
+// types/macros (PwGenOptions, pwgenOpts, PWGEN_MAX_LEN) and the
+// pwgenGenerate() function are already visible by the time screen_add.ino
+// uses them — no forward declaration needed here.
 void drawStatusBar();
 void pollTouch();
 void popToLock();
@@ -270,6 +296,29 @@ void dbSeed();
 void dbLoadIndex();
 bool dbAppend(const PassRecord &rec);
 bool dbLoadRecord(uint16_t id, PassRecord &out);
+bool dbExists();
+bool dbCreateEmpty();
+bool dbLegacyPlaintextExists();
+
+// vault_crypto.ino forward decls
+extern uint8_t vaultMasterKey[];
+extern bool    vaultUnlocked;
+bool vaultCryptoProvisioned();
+bool vaultCryptoProvision(const char *pin);
+bool vaultUnlock(const char *pin);
+bool vaultVerifyPin(const char *pin);
+bool vaultRewrapKey(const char *newPin);
+void vaultLock();
+void vaultCryptoErase();
+uint8_t vaultPinLength();
+void    vaultSetPinLength(uint8_t len);
+uint8_t pinDisplayLen();
+void    pinRefreshLength();
+
+// db_migrate.ino forward decls
+bool dbMigrationNeeded();
+uint16_t dbMigrationLegacyCount();
+bool dbMigrateLegacyPlaintext();
 
 // PIN lockout helpers (defined later in this file)
 void pinRegisterFail();
@@ -290,6 +339,8 @@ void drawAll() {
     case SCR_FLASH:       drawFlash();     break;
     case SCR_WIFI:        drawWifi();      break;
     case SCR_DEVICES:     drawDevices();   break;
+    case SCR_SETUP_PIN:   drawSetupPin();  break;
+    case SCR_MIGRATE:     drawMigrate();   break;
     default:                               break;
   }
 }
@@ -313,6 +364,8 @@ void dispatchTap(int16_t tx, int16_t ty) {
     case SCR_FLASH:       onTapFlash(tx, ty);      break;
     case SCR_WIFI:        onTapWifi(tx, ty);       break;
     case SCR_DEVICES:     onTapDevices(tx, ty);    break;
+    case SCR_SETUP_PIN:   onTapSetupPin(tx, ty);   break;
+    case SCR_MIGRATE:     onTapMigrate(tx, ty);    break;
     default:                                       break;
   }
 }
@@ -348,8 +401,17 @@ void popNav() {
   }
 }
 
+// Locking the device wipes the master key (and any in-flight PIN entry)
+// from RAM immediately — see vault_crypto.ino / vaultLock(). The
+// in-memory password index (titles/ids only, never secrets — see
+// storage.ino) is also dropped so a locked device holds nothing more
+// than non-sensitive labels, and those only until the next dbLoadIndex()
+// on re-unlock.
 void popToLock() {
   homeExitReorder();         // never leave the home in arrange mode
+  vaultLock();
+  passwordCount = 0;
+  ckSecureZero(pinEntry, sizeof(pinEntry));
   navTop = 0;
   navStack[0] = SCR_LOCK;
   current = SCR_LOCK;
@@ -383,18 +445,21 @@ void onSwipeEnd(int16_t totalDx, int16_t totalDy) {
 }
 
 // ── One-tap login fill (username + Tab + password + Enter) ────────────
+// NEVER log `user`/`pass` here — both can be vault secrets (or the
+// username field alone is still meaningful account metadata). Only the
+// transport choice and outcome are logged, and only in debug builds.
 void quickFillViaHID(const char *user, const char *pass) {
   // BLE first (wireless), then USB. BLE requires the on-device Accept gate
   // (bleAuthorized) — same rule as typeViaHID — so a connected-but-unaccepted
   // host can never be filled. USB requires the host to have enumerated us.
   if (settings.bleEnabled && hidBleCompiled() && hidBleConnected() && bleAuthorized) {
-    Serial.printf("[HID] quickFill→BLE user='%s'\n", user);
+    SK_LOGLN("[HID] quickFill -> BLE");
     hidBleQuickFill(user, pass);
     ledSet(0x0000FF, 250);
     return;
   }
   if (settings.usbHidEnabled && hidUsbCompiled() && hidUsbMounted()) {
-    Serial.printf("[HID] quickFill→USB user='%s'\n", user);
+    SK_LOGLN("[HID] quickFill -> USB");
     hidUsbQuickFill(user, pass);
     ledSet(0x00FF00, 250);
     return;
@@ -403,10 +468,13 @@ void quickFillViaHID(const char *user, const char *pass) {
 }
 
 // ── HID type dispatcher ───────────────────────────────────────────────
+// `s` is frequently a PASSWORD (called directly with detailRec.password
+// from screen_detail.ino) — it must NEVER be logged, in debug or release
+// builds. Only transport/state flags (booleans, not secrets) are logged.
 void typeViaHID(const char *s) {
-  Serial.printf("[HID] typeViaHID('%s')  bleEn=%d bleComp=%d bleConn=%d  usbEn=%d usbComp=%d\n",
-                s, settings.bleEnabled, hidBleCompiled(), hidBleConnected(),
-                settings.usbHidEnabled, hidUsbCompiled());
+  SK_LOG("[HID] typeViaHID() len=%d  bleEn=%d bleComp=%d bleConn=%d  usbEn=%d usbComp=%d\n",
+         (int)strlen(s), settings.bleEnabled, hidBleCompiled(), hidBleConnected(),
+         settings.usbHidEnabled, hidUsbCompiled());
 
   // ONE transport at a time. Both can be ENABLED and connected at once (the
   // S3 is dual-core, NimBLE + native USB coexist), but typing to BOTH into the
@@ -415,18 +483,18 @@ void typeViaHID(const char *s) {
   // otherwise USB. (Want USB instead while BLE is paired? Reject/Block the BLE
   // request, or turn Bluetooth off.)
   if (settings.bleEnabled && hidBleCompiled() && hidBleConnected() && bleAuthorized) {
-    Serial.println("[HID] routing → BLE");
+    SK_LOGLN("[HID] routing -> BLE");
     hidBlePrint(s);
     ledSet(0x0000FF, 200);
     return;
   }
   if (settings.usbHidEnabled && hidUsbCompiled() && hidUsbMounted()) {
-    Serial.println("[HID] routing → USB");
+    SK_LOGLN("[HID] routing -> USB");
     hidUsbPrint(s);
     ledSet(0x00FF00, 200);
     return;
   }
-  Serial.println("[HID] no transport ready");
+  SK_LOGLN("[HID] no transport ready");
 
   // Full-screen modal — clearly explains what to do
   gfx->fillScreen(C_BLACK);
@@ -553,7 +621,7 @@ void bleConnectGate() {
   if (choice == 0) {                         // ACCEPT
     bleAuthorized = true;
     ledSet(0x00FF00, 250);
-    Serial.println("[BLE] connection ACCEPTED by user");
+    SK_LOGLN("[BLE] connection ACCEPTED by user");
     // Remember this device so it's auto-approved next time — but ONLY once
     // bonding has resolved a STABLE identity. Saving before that stored the
     // phone's rotating private address, which never matched on reconnect
@@ -570,7 +638,7 @@ void bleConnectGate() {
       devsAdd(idAddr, idType);
       strncpy(connPeerId, idAddr, sizeof(connPeerId) - 1); connPeerId[sizeof(connPeerId) - 1] = 0;
       connPeerBonded = true;
-    } else Serial.println("[BLE] not bonded yet — not saved (accepted for now)");
+    } else SK_LOGLN("[BLE] not bonded yet — not saved (accepted for now)");
   } else if (choice == 2) {                  // BLOCK 5 min
     bleAuthorized = false;
     bleBlockUntil = millis() + 300000UL;     // this MAC silently kicked for 5 min
@@ -579,7 +647,7 @@ void bleConnectGate() {
     bleBlockedAddr[sizeof(bleBlockedAddr) - 1] = 0;
     hidBleDisconnectPeer();                  // kick only this peer, BLE keeps advertising
     ledSet(0xFF0000, 250);
-    Serial.printf("[BLE] BLOCKED %s for 5 min (BLE still up for other devices)\n", bleBlockedAddr);
+    SK_LOG("[BLE] BLOCKED peer for 5 min (BLE still up for other devices)\n");
   } else {                                   // REJECT
     // Snooze the gate for 2 minutes so a paired phone that auto-reconnects
     // doesn't spam the prompt every 20 seconds.  Typing stays blocked
@@ -588,7 +656,7 @@ void bleConnectGate() {
     bleAuthorized = false;
     bleGateSnooze = millis() + 120000UL;     // 2 min quiet
     ledSet(0xFF0000, 200);
-    Serial.println("[BLE] connection REJECTED (snoozed 2 min)");
+    SK_LOGLN("[BLE] connection REJECTED (snoozed 2 min)");
   }
   btConnected = settings.bleEnabled && hidBleCompiled() && hidBleConnected();
   drawAll();
@@ -601,7 +669,26 @@ void bleConnectGate() {
 // device does not reset the escalation. (millis() resets on reboot, so a
 // power-cycle still clears the *current* countdown — persisting the count
 // keeps the next wrong attempt jumping straight back to a long wait.)
-
+//
+// ── What this does and doesn't protect against ─────────────────────────
+// This counter is UI-level throttling, not the primary brute-force
+// defense. The real cost of a guess is the PBKDF2-HMAC-SHA256 KDF
+// (CK_PBKDF2_ITERATIONS, vault_crypto.ino) that every attempt — including
+// one made by directly reading NVS and replaying the unlock algorithm
+// off-device — must pay: there's no shortcut that skips it, because a
+// wrong PIN derives a wrong KEK, which fails to authenticate the wrapped
+// master key (AES-GCM), not "compares unequal to a stored value".
+//
+// This counter CAN be reset by clearing/rewriting "skset"/pinf in NVS —
+// on a device WITHOUT flash encryption enabled, someone who can already
+// read/write raw flash can also read the encrypted vault ciphertext
+// directly and brute-force it offline, where no on-device counter is
+// consulted at all. So: this lockout meaningfully slows a casual
+// "someone picked up my unlocked-adjacent device and is guessing on the
+// keypad" attack; it is NOT a substitute for ESP32-S3 Flash Encryption in
+// the threat model where the attacker has raw flash access. See
+// docs/SECURITY.md, "Flash Encryption / Secure Boot" and "Security
+// limitations".
 static uint32_t pinLockDelayMs(uint8_t fails) {
   if (fails < 3) return 0;
   switch (fails) {
@@ -619,7 +706,7 @@ void pinRegisterFail() {
   prefs.end();
   uint32_t d = pinLockDelayMs(pinFails);
   pinLockUntil = d ? millis() + d : 0;
-  Serial.printf("[PIN] fail #%u  lock=%lu ms\n", pinFails, (unsigned long)d);
+  SK_LOG("[PIN] fail #%u  lock=%lu ms\n", pinFails, (unsigned long)d);
 }
 
 void pinRegisterSuccess() {
@@ -639,6 +726,8 @@ uint32_t pinLockRemaining() {
 }
 
 // ── Settings persistence ──────────────────────────────────────────────
+// NOTE: the PIN is never read/written here — see vault_crypto.ino. Only
+// non-secret UI/behavior preferences live in the "skset" namespace.
 void loadSettings() {
   prefs.begin("skset", true);
   settings.brightness     = prefs.getUChar("br",   140);
@@ -647,11 +736,10 @@ void loadSettings() {
   settings.autoLockSec    = prefs.getUChar("alock", 30);
   settings.androidFix     = prefs.getBool ("afix", false);
   pinFails                = prefs.getUChar("pinf",  0);
-  String p = prefs.getString("pin", "1234");
-  strncpy(settings.pin, p.c_str(), 4); settings.pin[4] = 0;
   prefs.end();
   hidBleSetAndroidFix(settings.androidFix ? 1 : 0);
   hidUsbSetAndroidFix(settings.androidFix ? 1 : 0);
+  pinRefreshLength();
 }
 void saveSettings() {
   prefs.begin("skset", false);
@@ -660,7 +748,6 @@ void saveSettings() {
   prefs.putBool  ("usb",  settings.usbHidEnabled);
   prefs.putUChar ("alock", settings.autoLockSec);
   prefs.putBool  ("afix", settings.androidFix);
-  prefs.putString("pin",  settings.pin);
   prefs.end();
 }
 
@@ -778,10 +865,10 @@ void setup() {
       digitalWrite(TP_RST, LOW);  delay(8);
       digitalWrite(TP_RST, HIGH); delay(150);
     }
-    Serial.printf("[TOUCH] FT3168 %s\n", ack ? "ready" : "reset-pulsed");
+    SK_LOG("[TOUCH] FT3168 %s\n", ack ? "ready" : "reset-pulsed");
   }
 
-  Serial.printf("[MEM] PSRAM free: %u\n", ESP.getFreePsram());
+  SK_LOG("[MEM] PSRAM free: %u\n", ESP.getFreePsram());
   passwordIndex = (ListItem *)ps_malloc(MAX_PASSWORDS * sizeof(ListItem));
   if (!passwordIndex) {
     // The canvas works (we got here) but the 1.9MB password index won't fit —
@@ -796,12 +883,25 @@ void setup() {
     while (1) delay(1000);
   }
 
+  // NOTE: the password database is ENCRYPTED and cannot be read until the
+  // user unlocks with their PIN (which derives the master key — see
+  // vault_crypto.ino). dbLoadIndex() is called from the PIN/setup/migration
+  // screens on successful unlock, never here. This means passwordCount is
+  // legitimately 0 at boot even on a device with a full vault — that's
+  // correct, not a bug: the whole point is nothing decrypts before auth.
   if (!FFat.begin(true)) {
     Serial.println("ERROR: FFat mount failed");
-  } else {
-    dbLoadIndex();
-    Serial.printf("[DB] %u passwords loaded\n", passwordCount);
   }
+
+  // Decide which screen boot lands on:
+  //   • no crypto identity yet (brand new device)      → SCR_SETUP_PIN
+  //   • legacy plaintext /db.bin found (upgraded fw)    → SCR_SETUP_PIN,
+  //     which chains into SCR_MIGRATE once a new PIN is chosen
+  //   • normal case                                     → SCR_LOCK
+  bool needsSetup = !vaultCryptoProvisioned();
+  if (needsSetup) { extern void setupPinInit(); setupPinInit(); }
+  navStack[0] = needsSetup ? SCR_SETUP_PIN : SCR_LOCK;
+  current     = navStack[0];
 
   // Keep the logo a beat (it's been up during init), play the booting dots,
   // then power-down fade.
@@ -834,11 +934,11 @@ void setup() {
   if (digitalRead(USER_BTN_PIN) == LOW) {
     settings.bleEnabled = false;
     saveSettings();
-    Serial.println("[BLE] skipped & disabled (SW2 held at boot)");
+    SK_LOGLN("[BLE] skipped & disabled (SW2 held at boot)");
   } else if (settings.bleEnabled && hidBleCompiled()) {
-    Serial.println("[BLE] boot init start");
+    SK_LOGLN("[BLE] boot init start");
     hidBleBegin();
-    Serial.println("[BLE] boot init done");
+    SK_LOGLN("[BLE] boot init done");
   }
 }
 
@@ -849,6 +949,9 @@ void setup() {
 // All touch is ignored while off (see dispatchTap); only the button wakes.
 void screenSleep() {
   homeExitReorder();
+  vaultLock();
+  passwordCount = 0;
+  ckSecureZero(pinEntry, sizeof(pinEntry));
   navTop = 0; navStack[0] = SCR_LOCK; current = SCR_LOCK; pinLen = 0;
   drawAll();
   if (settings.bleEnabled && hidBleCompiled()) {
@@ -1023,7 +1126,7 @@ void loop() {
       if (devsFind(connPeerId) >= 0) {
         bleAuthorized = true;
         ledSet(0x00FF00, 200);
-        Serial.printf("[BLE] auto-approved saved device %s\n", connPeerId);
+        SK_LOGLN("[BLE] auto-approved saved device");
         if (current != SCR_FLASH) { drawStatusBar(); flushScreen(); }
         if (current == SCR_DEVICES) drawAll();   // live status on the screen
       }
@@ -1035,7 +1138,7 @@ void loop() {
     // but encryption/HID never come up, so typing goes nowhere. Kick it so the
     // phone fails cleanly and can re-pair fresh instead of ghosting forever.
     if (nowConn && !connPeerBonded && (millis() - connRisingAt) > 20000UL) {
-      Serial.println("[BLE] link never encrypted in 20s — kicking ghost link");
+      SK_LOGLN("[BLE] link never encrypted in 20s — kicking ghost link");
       hidBleDisconnectCached();
     }
 

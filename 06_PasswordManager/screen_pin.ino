@@ -1,8 +1,11 @@
 // =============================================================
-//  screen_pin.ino  —  4-digit PIN keypad  (monochrome)
+//  screen_pin.ino  —  PIN keypad (unlock)  (monochrome)
 //
-//  Correct PIN advances directly to HOME (bug fix — used to
-//  bounce back to LOCK).
+//  Correct PIN advances directly to HOME. The entered PIN is checked by
+//  calling vaultUnlock() (vault_crypto.ino) — there is no stored PIN to
+//  strcmp() against; a correct PIN is whatever successfully decrypts the
+//  wrapped master key. The PIN entry buffer is wiped immediately after
+//  every attempt (success or failure) — see pinEntryWipe().
 // =============================================================
 
 struct PinKey { const char *label; uint8_t row, col; };
@@ -25,8 +28,17 @@ int16_t pinYOffset = 0;
 int16_t pkX(uint8_t c) { return PK_X0 + c * (PK_W + PK_G); }
 int16_t pkY(uint8_t r) { return PK_Y0 + pinYOffset + r * (PK_H + PK_G); }
 
+// Zero the PIN entry buffer. Called after every attempt (right or wrong)
+// so a correct/incorrect PIN never lingers in RAM longer than the single
+// comparison that needs it.
+static void pinEntryWipe() {
+  ckSecureZero(pinEntry, sizeof(pinEntry));
+  pinLen = 0;
+}
+
 void drawPinInputBox() {
-  // Clean header + four dots — no boxy outline.
+  // Clean header + dots (one per entered digit, up to PIN_MAX_LEN) — no
+  // boxy outline.
   int16_t y = STATUS_H + 16 + pinYOffset;
   textCenter(y, "Enter PIN", 3, C_WHITE);
 
@@ -35,15 +47,18 @@ void drawPinInputBox() {
   int16_t shake = (millis() < shakeUntil)
                   ? ((millis() / 40) % 2 ? -8 : 8) : 0;
 
-  for (int i = 0; i < 4; i++) {
-    int16_t x = cx - 66 + i * 44 + shake;
+  // Dot spacing shrinks a little as PIN length grows so up to 8 dots
+  // still fit centered on screen.
+  int16_t spacing = (pinDisplayLen() > 6) ? 30 : 44;
+  int n = pinDisplayLen();
+  for (int i = 0; i < n; i++) {
+    int16_t x = cx - (spacing * (n - 1)) / 2 + i * spacing + shake;
     if (i < pinLen) {
-      // Filled dot — red while the wrong-PIN shake plays, blue otherwise
       uint16_t col = (millis() < shakeUntil) ? C_RED : C_BLUE;
-      gfx->fillCircle(x, cy, 10, col);
+      gfx->fillCircle(x, cy, 9, col);
     } else {
-      gfx->drawCircle(x, cy, 10, C_GRAY_3);
-      gfx->drawCircle(x, cy,  9, C_GRAY_3);
+      gfx->drawCircle(x, cy, 8, C_GRAY_3);
+      gfx->drawCircle(x, cy, 7, C_GRAY_3);
     }
   }
 }
@@ -127,23 +142,52 @@ void drawPin() {
 
 // Apple-Watch-style slide-up entrance: the keypad + entry box rise from the
 // bottom into place while the status bar stays put.
-//
-//   • NO per-frame delay — the canvas flush (~12 ms) already paces it; the
-//     old delay(12) just made it drag.
-//   • Cubic EASE-OUT — shoots up fast then settles, so it feels snappy
-//     ("fata-fat") instead of a slow constant crawl.
 void pinSlideIn() {
-  const int     STEPS = 5;                    // fewer frames → snappier, less touch-block
-  const int16_t START = 300;                 // keypad starts just off the bottom
+  const int     STEPS = 5;
+  const int16_t START = 300;
   for (int i = 1; i <= STEPS; i++) {
-    float t = (float)i / STEPS;              // 0 → 1
+    float t = (float)i / STEPS;
     float u = 1.0f - t;
-    float ease = 1.0f - u * u * u;           // cubic ease-out (fast, then gentle)
+    float ease = 1.0f - u * u * u;
     pinYOffset = (int16_t)(START * (1.0f - ease));
     drawPin();
   }
   pinYOffset = 0;
   drawPin();
+}
+
+// Shared "PIN accepted" transition into HOME, used by both the digit-typed
+// auto-submit path and the explicit OK key.
+static void pinUnlockSuccess() {
+  pinRegisterSuccess();
+  ledSet(0x00FF00, 200);
+  fadeOut();
+  navTop = 0;
+  navStack[0] = SCR_HOME;
+  current = SCR_HOME;
+
+  // Load the encrypted vault now that the master key is in RAM.
+  dbLoadIndex();
+  SK_LOG("[DB] %u passwords loaded\n", passwordCount);
+
+  drawAll();
+  fadeIn();
+}
+
+static void pinUnlockFail() {
+  pinRegisterFail();
+  shakeUntil = millis() + 500;
+  ledSet(0xFF0000, 400);
+}
+
+// Try the currently-entered PIN against the vault. Always wipes the entry
+// buffer afterward regardless of outcome.
+static void pinTryUnlock() {
+  pinEntry[pinLen] = 0;
+  bool ok = vaultUnlock(pinEntry);
+  pinEntryWipe();     // never let the typed PIN linger past this check
+  if (ok) pinUnlockSuccess();
+  else    pinUnlockFail();
 }
 
 void onTapPin(int16_t tx, int16_t ty) {
@@ -162,49 +206,12 @@ void onTapPin(int16_t tx, int16_t ty) {
 
     const char *k = PKEYS[i].label;
     if (strcmp(k, "BS") == 0) {
-      if (pinLen) pinLen--;
+      if (pinLen) { pinEntry[--pinLen] = 0; }
     } else if (strcmp(k, "OK") == 0) {
-      pinEntry[pinLen] = 0;
-      if (strcmp(pinEntry, settings.pin) == 0) {
-        pinLen = 0;
-        pinRegisterSuccess();
-        ledSet(0x00FF00, 200);
-        // Skip the "UNLOCKED" splash — straight to HOME for snappy feel
-        fadeOut();
-        navTop = 0;
-        navStack[0] = SCR_HOME;
-        current = SCR_HOME;
-        drawAll();
-        fadeIn();
-        return;
-      } else {
-        pinRegisterFail();
-        shakeUntil = millis() + 500;
-        pinLen = 0;
-        ledSet(0xFF0000, 400);
-      }
-    } else if (pinLen < 4) {
+      if (pinLen >= PIN_MIN_LEN) pinTryUnlock();
+    } else if (pinLen < pinDisplayLen()) {
       pinEntry[pinLen++] = k[0];
-      if (pinLen == 4) {
-        pinEntry[4] = 0;
-        if (strcmp(pinEntry, settings.pin) == 0) {
-          pinLen = 0;
-          pinRegisterSuccess();
-          ledSet(0x00FF00, 200);
-          fadeOut();
-          navTop = 0;
-          navStack[0] = SCR_HOME;
-          current = SCR_HOME;
-          drawAll();
-          fadeIn();
-          return;
-        } else {
-          pinRegisterFail();
-          shakeUntil = millis() + 500;
-          pinLen = 0;
-          ledSet(0xFF0000, 400);
-        }
-      }
+      if (pinLen == pinDisplayLen()) { pinTryUnlock(); drawPin(); return; }
     }
     drawPin();
     return;

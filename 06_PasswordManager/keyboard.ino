@@ -62,9 +62,13 @@ static const char *LAYER_CHARS[4] = {
 // Label on the layer key = what you GET if you tap it (next layer).
 static const char *LAYER_NEXT_LABEL[4] = { "ABC", "#+=", "2/2", "abc" };
 
+// kbBuffer is shared by every text field the on-screen keyboard drives —
+// including the PASSWORD field on the Add/Edit screen — so resetting it
+// securely wipes rather than just truncating with a single NUL (which
+// would leave the rest of the old value sitting in the buffer).
 void kbReset() {
   kbLayer = 0;
-  kbBuffer[0] = 0;
+  ckSecureZero(kbBuffer, sizeof(kbBuffer));
   kbLen = 0;
 }
 
@@ -111,9 +115,8 @@ static const char *KB_DICT[] = {
   "zerodha", "zerodha.com",
   "zomato", "zomato.com",
   "zoom", "zoom.us",
-  "admin", "user", "test", "root", "shubh",
+  "admin", "user", "test", "root",
   "demo", "guest", "support",
-  "shubh@gmail.com", "shubh@outlook.com",
   "www.", "https://", "http://",
 };
 static const int KB_DICT_SIZE = sizeof(KB_DICT) / sizeof(KB_DICT[0]);

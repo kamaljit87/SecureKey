@@ -3,19 +3,34 @@
 //
 //     Enter current PIN  →  Enter new PIN  →  Confirm new PIN
 //
+//  The OLD PIN is verified with vaultUnlock() — the same call the lock
+//  screen uses — so there is no separate stored PIN to strcmp() against.
+//  On success, vaultRewrapKey() re-wraps the EXISTING master key under a
+//  freshly PBKDF2-derived KEK (new random salt + nonce): the database
+//  itself is untouched (still the same master key, so no re-encryption
+//  of every record is needed), only the wrapping around that key changes.
+//
 //  Self-contained keypad (doesn't reuse screen_pin's PKEYS, since
 //  Arduino concatenates files alphabetically and this one comes
 //  first — file-scope vars wouldn't be visible yet).
 // =============================================================
 
 static uint8_t  cpStep = 0;          // 0=current, 1=new, 2=confirm
-static char     cpBuf[5]  = {0};
+static char     cpBuf[PIN_MAX_LEN + 1]  = {0};
 static uint8_t  cpLen     = 0;
-static char     cpNew[5]  = {0};
+static char     cpNew[PIN_MAX_LEN + 1]  = {0};
 static uint32_t cpShake   = 0;
+static uint8_t  cpTargetLen = PIN_MIN_LEN;   // length of the CURRENT pin (step 0)
+static uint8_t  cpNewLen    = PIN_RECOMMENDED_LEN; // chosen length for the NEW pin
+
+static void cpBufWipe() { ckSecureZero(cpBuf, sizeof(cpBuf)); cpLen = 0; }
+static void cpNewWipe() { ckSecureZero(cpNew, sizeof(cpNew)); }
 
 void chgPinInit() {
-  cpStep = 0; cpLen = 0; cpBuf[0] = 0; cpNew[0] = 0; cpShake = 0;
+  cpStep = 0; cpShake = 0;
+  cpBufWipe(); cpNewWipe();
+  cpTargetLen = pinDisplayLen();   // how many digits the EXISTING PIN has
+  cpNewLen    = PIN_RECOMMENDED_LEN;
 }
 
 // ── Keypad geometry ───────────────────────────────────────────
@@ -48,6 +63,10 @@ static void drawCpKey(uint8_t i, bool pressed) {
   gfx->print(lbl);
 }
 
+static uint8_t cpCurrentStepLen() {
+  return (cpStep == 0) ? cpTargetLen : cpNewLen;
+}
+
 void drawChgPin() {
   gfx->fillScreen(C_BLACK);
   drawStatusBar();
@@ -58,56 +77,98 @@ void drawChgPin() {
   };
   textCenter(STATUS_H + NAV_H + 8, titles[cpStep], 2, C_WHITE);
 
-  // 4 dots
+  // Dots — sized to whichever PIN length this step expects.
   int16_t cx = LCD_WIDTH / 2;
   int16_t dy = STATUS_H + NAV_H + 40;
   int16_t shake = (millis() < cpShake) ? ((millis() / 40) % 2 ? -8 : 8) : 0;
-  for (int i = 0; i < 4; i++) {
-    int16_t x = cx - 54 + i * 36 + shake;
+  uint8_t n = cpCurrentStepLen();
+  int16_t spacing = (n > 6) ? 26 : 36;
+  for (int i = 0; i < n; i++) {
+    int16_t x = cx - (spacing * (n - 1)) / 2 + i * spacing + shake;
     if (i < cpLen)
       gfx->fillCircle(x, dy, 9, (millis() < cpShake) ? C_GRAY_3 : C_WHITE);
     else
       gfx->drawCircle(x, dy, 9, C_GRAY_3);
   }
 
+  // On the "new PIN" step, offer a quick length picker above the keypad —
+  // tapping it restarts entry at the chosen length (never silently changes
+  // length mid-entry).
+  if (cpStep == 1 && cpLen == 0) {
+    char lb[36];
+    snprintf(lb, sizeof(lb), "Length: %u  (tap to change)", cpNewLen);
+    textCenter(dy + 26, lb, 1, C_GRAY_4);
+  }
+
   for (uint8_t i = 0; i < 12; i++) drawCpKey(i, false);
   flushScreen();
 }
 
-// Process a completed 4-digit entry for the current step.
+// Process a completed entry for the current step.
 static void cpProcess() {
-  cpBuf[4] = 0;
-  if (cpStep == 0) {                       // verify current
-    if (strcmp(cpBuf, settings.pin) == 0) {
-      cpStep = 1; cpLen = 0; cpBuf[0] = 0;
+  cpBuf[cpLen] = 0;
+  if (cpStep == 0) {                       // verify current PIN
+    // vaultVerifyPin() checks the PIN against the LIVE unlocked session
+    // without touching vaultMasterKey/vaultUnlocked — a wrong re-entry
+    // here must not lock the user out of the session they're already in
+    // (unlike vaultUnlock(), which is for the lock screen itself).
+    if (vaultVerifyPin(cpBuf)) {
+      cpBufWipe();
+      cpStep = 1;
     } else {
-      cpShake = millis() + 500; cpLen = 0; cpBuf[0] = 0; ledSet(0xFF0000, 400);
+      cpShake = millis() + 500; cpBufWipe(); ledSet(0xFF0000, 400);
     }
   } else if (cpStep == 1) {                // capture new
-    strcpy(cpNew, cpBuf); cpStep = 2; cpLen = 0; cpBuf[0] = 0;
+    strncpy(cpNew, cpBuf, sizeof(cpNew) - 1);
+    cpBufWipe();
+    cpStep = 2;
   } else {                                 // confirm
     if (strcmp(cpBuf, cpNew) == 0) {
-      strncpy(settings.pin, cpNew, 4); settings.pin[4] = 0;
-      saveSettings();
+      bool ok = vaultRewrapKey(cpNew);
+      cpBufWipe(); cpNewWipe();
+      if (ok) pinRefreshLength();   // new PIN may be a different length
       gfx->fillScreen(C_BLACK); drawStatusBar();
-      textCenter(LCD_HEIGHT/2 - 16, "PIN CHANGED", 3, C_WHITE);
-      flushScreen(); ledSet(0x00FF00, 500); delay(1200);
-      popNav(); return;
+      if (ok) {
+        textCenter(LCD_HEIGHT/2 - 16, "PIN CHANGED", 3, C_WHITE);
+        flushScreen(); ledSet(0x00FF00, 500); delay(1200);
+        popNav(); return;
+      } else {
+        textCenter(LCD_HEIGHT/2 - 16, "CHANGE FAILED", 3, C_RED);
+        textCenter(LCD_HEIGHT/2 + 20, "PIN unchanged. Try again.", 1, C_GRAY_4);
+        flushScreen(); ledSet(0xFF0000, 600); delay(1600);
+        chgPinInit();
+        drawChgPin(); return;
+      }
     } else {                               // mismatch — restart at "new"
       cpShake = millis() + 500;
-      cpStep = 1; cpLen = 0; cpBuf[0] = 0; cpNew[0] = 0;
+      cpStep = 1; cpBufWipe(); cpNewWipe();
       ledSet(0xFF0000, 400);
     }
   }
   drawChgPin();
 }
 
+static bool cpTapLengthPicker(int16_t tx, int16_t ty) {
+  int16_t dy = STATUS_H + NAV_H + 40 + 26;
+  if (ty < dy - 14 || ty > dy + 14) return false;
+  // Cycle 4 -> 6 -> 8 -> 4 on tap, without needing separate hit boxes.
+  cpNewLen = (cpNewLen == 4) ? 6 : (cpNewLen == 6) ? 8 : 4;
+  return true;
+}
+
 void onTapChgPin(int16_t tx, int16_t ty) {
   // Back
   if (ty >= STATUS_H + 2 && ty < STATUS_H + NAV_H - 2
       && tx >= SAFE_PAD && tx < SAFE_PAD + 46) {
+    cpBufWipe(); cpNewWipe();
     popNav(); return;
   }
+
+  if (cpStep == 1 && cpLen == 0 && cpTapLengthPicker(tx, ty)) {
+    drawChgPin();
+    return;
+  }
+
   for (uint8_t i = 0; i < 12; i++) {
     int16_t x = cpkX(i), y = cpkY(i);
     if (tx < x || tx >= x + CP_W) continue;
@@ -116,14 +177,14 @@ void onTapChgPin(int16_t tx, int16_t ty) {
     drawCpKey(i, true); flushScreen(); delay(50);
 
     const char *k = CP_KEYS[i];
+    uint8_t need = cpCurrentStepLen();
     if (strcmp(k, "BS") == 0) {
-      if (cpLen) cpLen--;
-      cpBuf[cpLen] = 0;
+      if (cpLen) { cpBuf[--cpLen] = 0; }
     } else if (strcmp(k, "OK") == 0) {
-      if (cpLen == 4) { cpProcess(); return; }
-    } else if (cpLen < 4) {
+      if (cpLen == need) { cpProcess(); return; }
+    } else if (cpLen < need) {
       cpBuf[cpLen++] = k[0]; cpBuf[cpLen] = 0;
-      if (cpLen == 4) { cpProcess(); return; }
+      if (cpLen == need) { cpProcess(); return; }
     }
     drawChgPin();
     return;

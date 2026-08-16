@@ -1,137 +1,324 @@
 // =============================================================
-//  storage.ino  —  FFat binary password database
+//  storage.ino  —  Encrypted FFat password database
 //
-//  File:  /db.bin
-//  Format: fixed-size PassRecord records (256 bytes each).
-//  Index: loaded into PSRAM at boot (ListItem array, 64 bytes/entry).
-//  Max entries: MAX_PASSWORDS (30000).  30000×256 ≈ 7.3 MB on FAT.
+//  File:   /db.bin        (authenticated-encrypted, AES-256-GCM)
+//  Format: DbHeader, then fixed-size DbRecordOnDisk entries.
+//  Index:  loaded into PSRAM at boot (ListItem array, non-sensitive
+//          metadata ONLY — id/favorite/folder/title, see below).
+//
+//  ── Why title/folder are readable in the index ──────────────────────
+//  The list/search UI needs to render thousands of rows without
+//  decrypting the whole vault on every scroll frame. Title and folder
+//  are UI labels, not secrets on their own (they're what's shown in the
+//  list before you've unlocked into a specific entry) — password,
+//  username, url and note are ALWAYS the encrypted payload and are only
+//  decrypted for the one record currently on screen (dbLoadRecord),
+//  then wiped again once no longer needed. See docs/SECURITY.md
+//  "reduced plaintext residence time".
+//
+//  Each record is individually encrypted with its own random 96-bit
+//  nonce — nonces are NEVER reused with the master key (a fresh nonce is
+//  drawn from the HW RNG every time a record is written), and the record
+//  id + deleted flag are authenticated (GCM AAD) so a ciphertext can't be
+//  silently swapped onto a different slot.
+//
+//  Crash-safety: every mutating op (append/update/delete) writes a full
+//  new file to /db_tmp.bin, verifies it can be re-opened and its header
+//  re-read, and only THEN atomically replaces /db.bin. A power loss
+//  mid-write leaves the OLD /db.bin intact — never a half-written file.
 // =============================================================
+#include "crypto_core.h"
+#include "shared_types.h"   // DbHeader/DbRecordOnDisk/DB_* — shared with db_migrate.ino
 
-#define DB_PATH  "/db.bin"
-
-// ── Helpers ──────────────────────────────────────────────────
-static uint16_t dbCount() {
-  File f = FFat.open(DB_PATH, "r");
-  if (!f) return 0;
-  uint16_t n = (uint16_t)(f.size() / RECORD_SIZE);
-  f.close();
-  return n;
+// ── AAD binding: id + deleted + favorite are authenticated but not
+//    encrypted, so a byte-level swap/splice of records can't quietly
+//    reassign a ciphertext to a different id or resurrect a deleted one.
+static void dbBuildAad(uint8_t *aad, uint16_t id, uint8_t deleted, uint8_t favorite) {
+  memcpy(aad, &id, 2);
+  aad[2] = deleted;
+  aad[3] = favorite;
 }
 
-// ── Load index into PSRAM ────────────────────────────────────
+// ── Encrypt/decrypt one record's payload ─────────────────────
+// NOT static: db_migrate.ino (which sorts alphabetically BEFORE this
+// file, so Arduino's auto-generated prototypes are what make the call
+// resolve) also calls these directly during the one-time legacy-database
+// migration — see db_migrate.ino's dbMigrateLegacyPlaintext().
+bool dbEncryptRecord(const PassRecord &rec, DbRecordOnDisk &out) {
+  out.id       = rec.id;
+  out.deleted  = rec.deleted;
+  out.favorite = rec.favorite;
+  ckRandomBytes(out.nonce, sizeof(out.nonce));   // fresh nonce EVERY write
+
+  DbPlainPayload pt;
+  memset(&pt, 0, sizeof(pt));
+  strncpy(pt.folder,   rec.folder,   sizeof(pt.folder)   - 1);
+  strncpy(pt.title,    rec.title,    sizeof(pt.title)    - 1);
+  strncpy(pt.username, rec.username, sizeof(pt.username) - 1);
+  strncpy(pt.password, rec.password, sizeof(pt.password) - 1);
+  strncpy(pt.url,      rec.url,      sizeof(pt.url)      - 1);
+  strncpy(pt.note,     rec.note,     sizeof(pt.note)     - 1);
+
+  uint8_t aad[DB_AAD_LEN];
+  dbBuildAad(aad, out.id, out.deleted, out.favorite);
+
+  bool ok = ckAesGcmEncrypt(vaultMasterKey, out.nonce, sizeof(out.nonce),
+                            aad, sizeof(aad),
+                            (const uint8_t *)&pt, sizeof(pt),
+                            out.ciphertext, out.tag);
+  ckSecureZero(&pt, sizeof(pt));
+  return ok;
+}
+
+bool dbDecryptRecord(const DbRecordOnDisk &in, PassRecord &rec) {
+  uint8_t aad[DB_AAD_LEN];
+  dbBuildAad(aad, in.id, in.deleted, in.favorite);
+
+  DbPlainPayload pt;
+  bool ok = ckAesGcmDecrypt(vaultMasterKey, in.nonce, sizeof(in.nonce),
+                            aad, sizeof(aad),
+                            in.ciphertext, sizeof(in.ciphertext),
+                            in.tag, (uint8_t *)&pt);
+  if (!ok) {
+    ckSecureZero(&pt, sizeof(pt));
+    return false;
+  }
+
+  memset(&rec, 0, sizeof(rec));
+  rec.id       = in.id;
+  rec.deleted  = in.deleted;
+  rec.favorite = in.favorite;
+  strncpy(rec.folder,   pt.folder,   sizeof(rec.folder)   - 1);
+  strncpy(rec.title,    pt.title,    sizeof(rec.title)    - 1);
+  strncpy(rec.username, pt.username, sizeof(rec.username) - 1);
+  strncpy(rec.password, pt.password, sizeof(rec.password) - 1);
+  strncpy(rec.url,      pt.url,      sizeof(rec.url)      - 1);
+  strncpy(rec.note,     pt.note,     sizeof(rec.note)     - 1);
+  ckSecureZero(&pt, sizeof(pt));
+  return true;
+}
+
+// ── Header helpers ────────────────────────────────────────────
+// Also NOT static — db_migrate.ino calls both directly (see note above).
+bool dbReadHeader(File &f, DbHeader &hdr) {
+  if (f.read((uint8_t *)&hdr, sizeof(hdr)) != sizeof(hdr)) return false;
+  return memcmp(hdr.magic, DB_MAGIC, 4) == 0;
+}
+void dbWriteHeader(File &f, uint16_t count) {
+  DbHeader hdr;
+  memcpy(hdr.magic, DB_MAGIC, 4);
+  hdr.formatVersion   = DB_FORMAT_VERSION;
+  hdr.securityVersion = SECURITY_VERSION;
+  hdr.recordCount     = count;
+  hdr.reserved        = 0;
+  f.write((uint8_t *)&hdr, sizeof(hdr));
+}
+
+// True if /db.bin exists and starts with our current magic.
+bool dbExists() {
+  File f = FFat.open(DB_PATH, "r");
+  if (!f) return false;
+  DbHeader hdr;
+  bool ok = dbReadHeader(f, hdr);
+  f.close();
+  return ok;
+}
+
+// Detects a PRE-ENCRYPTION (v1) plaintext database: right file size
+// class and no "SKV2" magic at the front. Used only by the migration
+// path (see dbMigrateLegacyIfPresent below) — production firmware never
+// writes this format.
+bool dbLegacyPlaintextExists() {
+  File f = FFat.open(DB_PATH, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  char magic[4] = {0};
+  f.read((uint8_t *)magic, 4);
+  f.close();
+  if (memcmp(magic, DB_MAGIC, 4) == 0) return false;         // already v2
+  if (sz == 0 || sz % LEGACY_RECORD_SIZE != 0) return false;  // not v1 shape
+  return true;
+}
+
+// ── Load index into PSRAM (metadata only — see file header note) ─────
 void dbLoadIndex() {
   passwordCount = 0;
+  if (!vaultUnlocked) return;   // never touch the DB while locked
   File f = FFat.open(DB_PATH, "r");
   if (!f) return;
+  DbHeader hdr;
+  if (!dbReadHeader(f, hdr)) { f.close(); return; }
 
-  PassRecord rec;
-  while (f.available() >= RECORD_SIZE && passwordCount < MAX_PASSWORDS) {
-    f.read((uint8_t *)&rec, RECORD_SIZE);
+  DbRecordOnDisk rec;
+  while (f.available() >= (int)DB_RECORD_SIZE && passwordCount < MAX_PASSWORDS) {
+    if (f.read((uint8_t *)&rec, DB_RECORD_SIZE) != DB_RECORD_SIZE) break;
     if (rec.deleted) continue;
+    PassRecord pr;
+    if (!dbDecryptRecord(rec, pr)) {
+      // Corrupt/tampered record — skip it rather than crash or show
+      // garbage. (Could also flag this on-screen; kept silent-safe here
+      // since a single bad record shouldn't block the whole list.)
+      continue;
+    }
     ListItem &li = passwordIndex[passwordCount++];
-    li.id = rec.id;
-    li.favorite = rec.favorite;
-    strncpy(li.folder, rec.folder, sizeof(li.folder) - 1);
+    li.id = pr.id;
+    li.favorite = pr.favorite;
+    strncpy(li.folder, pr.folder, sizeof(li.folder) - 1);
     li.folder[sizeof(li.folder) - 1] = 0;
-    strncpy(li.title, rec.title, sizeof(li.title) - 1);
+    strncpy(li.title, pr.title, sizeof(li.title) - 1);
     li.title[sizeof(li.title) - 1] = 0;
+    ckSecureZero(&pr, sizeof(pr));   // title/folder already copied out above
   }
   f.close();
 }
 
-// ── Load a single full record by id ─────────────────────────
+// ── Load + decrypt a single full record by id ─────────────────
+// Plaintext lives ONLY in `out_rec`, which the caller owns and must wipe
+// (ckSecureZero) once it's no longer displayed/typed. This function does
+// not cache or retain any copy of it.
 bool dbLoadRecord(uint16_t id, PassRecord &out_rec) {
+  if (!vaultUnlocked) return false;
   File f = FFat.open(DB_PATH, "r");
-  if (!f) { Serial.println("[DB] dbLoadRecord: open failed"); return false; }
+  if (!f) return false;
+  DbHeader hdr;
+  if (!dbReadHeader(f, hdr)) { f.close(); return false; }
 
-  PassRecord rec;
-  while (f.available() >= RECORD_SIZE) {
-    f.read((uint8_t *)&rec, RECORD_SIZE);
+  DbRecordOnDisk rec;
+  while (f.available() >= (int)DB_RECORD_SIZE) {
+    if (f.read((uint8_t *)&rec, DB_RECORD_SIZE) != DB_RECORD_SIZE) break;
     if (rec.id == id && !rec.deleted) {
-      out_rec = rec;
       f.close();
-      Serial.printf("[DB] Load id=%u OK  title='%s'  pass_len=%u\n",
-                    id, out_rec.title, (unsigned)strlen(out_rec.password));
-      return true;
+      return dbDecryptRecord(rec, out_rec);
     }
   }
   f.close();
-  Serial.printf("[DB] Load id=%u NOT FOUND\n", id);
   return false;
 }
 
-// ── Append a new record ──────────────────────────────────────
-// Robust against the FFat quirk where "a" mode silently fails
-// if the file doesn't exist yet — falls back to "w" in that case,
-// flushes explicitly before close, and verifies bytes written.
-bool dbAppend(const PassRecord &rec) {
-  File f;
-  if (FFat.exists(DB_PATH)) {
-    f = FFat.open(DB_PATH, "a");
-  } else {
-    f = FFat.open(DB_PATH, "w");
-  }
-  if (!f) {
-    Serial.println("[DB] ERROR: open for append failed");
-    return false;
-  }
-  size_t before = f.size();
-  size_t n = f.write((const uint8_t *)&rec, RECORD_SIZE);
-  f.flush();
-  f.close();
-  if (n != RECORD_SIZE) {
-    Serial.printf("[DB] ERROR: wrote only %u of %u bytes\n",
-                  (unsigned)n, (unsigned)RECORD_SIZE);
-    return false;
-  }
-  Serial.printf("[DB] Appended id=%u '%s'  (file was %u, now ~%u)\n",
-                rec.id, rec.title,
-                (unsigned)before, (unsigned)(before + RECORD_SIZE));
-  return true;
-}
+// ── Rewrite the WHOLE database transactionally ────────────────
+// Shared by append/update/delete: read every existing record, apply the
+// caller's mutation callback, write the result to db_tmp.bin, verify it,
+// then atomically replace db.bin. This guarantees a sudden power loss
+// never leaves a half-written or partially-encrypted file: either the
+// OLD db.bin survives untouched, or the fully-written+verified NEW one
+// does — never something in between.
+//
+// mutate(rec, ctx) is called once per existing record (in file order) and
+// may modify `rec` in place; returning false means "write this record
+// unchanged". `onAppend`, if non-null, is called once after all existing
+// records have been processed, to optionally append a brand-new one.
+// (DbMutateFn/DbAppendFn are defined in shared_types.h.)
+static bool dbRewriteTransacted(DbMutateFn mutate, void *mutateCtx,
+                                DbAppendFn append, void *appendCtx) {
+  if (!vaultUnlocked) return false;
 
-// ── Mark record as deleted (soft delete) ────────────────────
-bool dbDelete(uint16_t id) {
-  // We rewrite the file with matching record deleted flag set
+  File dst = FFat.open(DB_TMP_PATH, "w");
+  if (!dst) return false;
+
+  uint16_t count = 0;
+  dbWriteHeader(dst, 0);   // placeholder — real count patched in below
+
   File src = FFat.open(DB_PATH, "r");
-  if (!src) return false;
-  File dst = FFat.open("/db_tmp.bin", "w");
-  if (!dst) { src.close(); return false; }
-
-  PassRecord rec;
-  while (src.available() >= RECORD_SIZE) {
-    src.read((uint8_t *)&rec, RECORD_SIZE);
-    if (rec.id == id) rec.deleted = 1;
-    dst.write((uint8_t *)&rec, RECORD_SIZE);
+  if (src) {
+    DbHeader shdr;
+    if (dbReadHeader(src, shdr)) {
+      DbRecordOnDisk rec;
+      while (src.available() >= (int)DB_RECORD_SIZE) {
+        if (src.read((uint8_t *)&rec, DB_RECORD_SIZE) != (int)DB_RECORD_SIZE) break;
+        if (mutate) mutate(rec, mutateCtx);
+        dst.write((uint8_t *)&rec, DB_RECORD_SIZE);
+        count++;
+      }
+    }
+    src.close();
   }
-  src.close(); dst.close();
-  FFat.remove(DB_PATH);
-  FFat.rename("/db_tmp.bin", DB_PATH);
-  return true;
-}
 
-// ── Update an existing record (rewrite file, replace matching id) ───
-bool dbUpdate(uint16_t id, const PassRecord &newRec) {
-  File src = FFat.open(DB_PATH, "r");
-  if (!src) return false;
-  File dst = FFat.open("/db_tmp.bin", "w");
-  if (!dst) { src.close(); return false; }
-
-  PassRecord rec; bool found = false;
-  while (src.available() >= RECORD_SIZE) {
-    src.read((uint8_t *)&rec, RECORD_SIZE);
-    if (rec.id == id && !rec.deleted) {
-      PassRecord up = newRec; up.id = id; up.deleted = 0;
-      dst.write((uint8_t *)&up, RECORD_SIZE);
-      found = true;
-    } else {
-      dst.write((uint8_t *)&rec, RECORD_SIZE);
+  if (append) {
+    DbRecordOnDisk newRec;
+    memset(&newRec, 0, sizeof(newRec));
+    if (append(newRec, appendCtx)) {
+      dst.write((uint8_t *)&newRec, DB_RECORD_SIZE);
+      count++;
     }
   }
-  src.close(); dst.close();
+
+  // Patch the real record count into the header.
+  dst.flush();
+  dst.seek(0);
+  dbWriteHeader(dst, count);
+  dst.flush();
+  dst.close();
+
+  // ── Verify before ever touching the real db.bin ──────────────────
+  File verify = FFat.open(DB_TMP_PATH, "r");
+  if (!verify) { FFat.remove(DB_TMP_PATH); return false; }
+  DbHeader vhdr;
+  bool verifyOk = dbReadHeader(verify, vhdr) && vhdr.recordCount == count;
+  // Spot-check the file is exactly the expected size (header + N records) —
+  // catches a truncated write from a brownout mid-flush.
+  size_t expectedSize = sizeof(DbHeader) + (size_t)count * DB_RECORD_SIZE;
+  verifyOk = verifyOk && (verify.size() == expectedSize);
+  verify.close();
+  if (!verifyOk) { FFat.remove(DB_TMP_PATH); return false; }
+
+  // Atomic swap: remove the old file, then rename the verified new one
+  // over it. FFat (FAT) has no atomic rename-replace, so there is a brief
+  // window with neither name present — but by this point the new file is
+  // fully written AND verified, so the only risk is a power loss in that
+  // narrow window, which loses nothing that wasn't already safely on disk
+  // as db_tmp.bin (recoverable by hand); it can never produce a corrupt
+  // or half-encrypted db.bin.
   FFat.remove(DB_PATH);
-  FFat.rename("/db_tmp.bin", DB_PATH);
-  return found;
+  FFat.rename(DB_TMP_PATH, DB_PATH);
+  return true;
+}
+
+// ── Public mutation API (same signatures callers already use) ─────────
+
+struct AppendCtx { const PassRecord *rec; };
+static bool appendCb(DbRecordOnDisk &out, void *ctx) {
+  AppendCtx *c = (AppendCtx *)ctx;
+  return dbEncryptRecord(*c->rec, out);
+}
+
+bool dbAppend(const PassRecord &rec) {
+  AppendCtx ctx{ &rec };
+  return dbRewriteTransacted(nullptr, nullptr, appendCb, &ctx);
+}
+
+struct DeleteCtx { uint16_t id; };
+static bool deleteCb(DbRecordOnDisk &rec, void *ctx) {
+  DeleteCtx *c = (DeleteCtx *)ctx;
+  if (rec.id == c->id) rec.deleted = 1;
+  return true;
+}
+
+bool dbDelete(uint16_t id) {
+  DeleteCtx ctx{ id };
+  return dbRewriteTransacted(deleteCb, &ctx, nullptr, nullptr);
+}
+
+struct UpdateCtx { uint16_t id; const PassRecord *newRec; bool found; };
+static bool updateCb(DbRecordOnDisk &rec, void *ctx) {
+  UpdateCtx *c = (UpdateCtx *)ctx;
+  if (rec.id == c->id && !rec.deleted) {
+    PassRecord up = *c->newRec;
+    up.id = c->id;
+    up.deleted = 0;
+    DbRecordOnDisk enc;
+    if (dbEncryptRecord(up, enc)) {
+      enc.id = c->id;
+      rec = enc;
+      c->found = true;
+    }
+  }
+  return true;
+}
+
+bool dbUpdate(uint16_t id, const PassRecord &newRec) {
+  UpdateCtx ctx{ id, &newRec, false };
+  if (!dbRewriteTransacted(updateCb, &ctx, nullptr, nullptr)) return false;
+  return ctx.found;
 }
 
 // ── Toggle the "favorite" (heart) flag on a record ──────────────────
@@ -140,6 +327,7 @@ bool dbToggleFavorite(uint16_t id) {
   if (!dbLoadRecord(id, rec)) return false;
   rec.favorite = rec.favorite ? 0 : 1;
   bool ok = dbUpdate(id, rec);
+  ckSecureZero(&rec, sizeof(rec));
   if (ok) dbLoadIndex();          // refresh in-memory index (favorite flags)
   return ok;
 }
@@ -152,47 +340,49 @@ static uint16_t dbNextId() {
   return maxId + 1;
 }
 
-// ── Seed demo passwords on first boot ────────────────────────
-// "folder" field is reused as the subtitle (URL) in this monochrome
-// build, so we put the short URL there too.
+// ── Create a fresh, empty encrypted database ─────────────────
+// Called on very first boot (no db.bin at all) once the vault has been
+// provisioned and unlocked, and after a factory reset.
+bool dbCreateEmpty() {
+  if (!vaultUnlocked) return false;
+  File f = FFat.open(DB_PATH, "w");
+  if (!f) return false;
+  dbWriteHeader(f, 0);
+  f.flush();
+  f.close();
+  return true;
+}
+
+// =============================================================
+//  Demo / seed data — DEVELOPMENT BUILDS ONLY
+//
+//  Real-looking demo credentials must never ship in a production
+//  firmware. Gated behind SECUREKEY_DEMO_MODE (see theme.h / build
+//  flags); a production build compiles this out entirely and dbSeed()
+//  becomes a no-op. Even in demo mode, the data below uses obviously
+//  fake example.invalid addresses instead of real-looking site logins.
+// =============================================================
+#ifdef SECUREKEY_DEMO_MODE
 struct SeedEntry { const char *title, *user, *pass, *url, *note; };
 static const SeedEntry SEEDS[] = {
-  {"Amazon",        "shubh@gmail.com",   "Amzn$hop99",    "www.amazon.com",        ""},
-  {"Apple ID",      "shubh@icloud.com",  "iCl0ud#24",     "appleid.apple.com",     ""},
-  {"Dropbox",       "shubh@gmail.com",   "Dr0pbox@24",    "www.dropbox.com",       ""},
-  {"Epic Games",    "shubhgamer408",     "Epic@2024!",    "epicgames.com",         ""},
-  {"Facebook",      "shubh@gmail.com",   "FBpass#99",     "facebook.com",          ""},
-  {"Flipkart",      "shubh@gmail.com",   "Flip#kart1",    "www.flipkart.com",      ""},
-  {"GitHub",        "Shubhjaiswal408",   "GH_token_24",   "github.com",            "Work"},
-  {"Gmail Personal","shubh@gmail.com",   "Gm@il#p24",     "gmail.com",             ""},
-  {"Gmail Work",    "shubh@company.com", "Gw0rk$2024",    "gmail.com",             "Work"},
-  {"Google Drive",  "shubh@gmail.com",   "GDr!ve24",      "drive.google.com",      ""},
-  {"Google Pay",    "+91 9876543210",    "gp_pin_7789",   "pay.google.com",        ""},
-  {"HDFC Bank",     "shubhjaiswal408",   "hdfcP@ss24",    "www.hdfcbank.com",      ""},
-  {"Instagram",     "shubh@gmail.com",   "Insta@2024!",   "www.instagram.com",     ""},
-  {"Jira",          "shubhjaiswal",      "JiraAdm#1",     "jira.company.com",      ""},
-  {"LinkedIn",      "shubh@gmail.com",   "LI_Pass@99",    "linkedin.com",          ""},
-  {"Myntra",        "shubh@gmail.com",   "Myn!ra2024",    "www.myntra.com",        ""},
-  {"Notion",        "shubh@company.com", "N0tion$2024",   "notion.so",             ""},
-  {"Outlook",       "shubh@outlook.com", "Outl00k$24",    "outlook.com",           ""},
-  {"PayTM",         "shubh@gmail.com",   "Ptm@2024!",     "www.paytm.com",         ""},
-  {"Slack",         "shubh@company.com", "Sl@ck2024!",    "slack.com",             ""},
-  {"Steam",         "shubhgamer408",     "St3am!P24",     "store.steampowered.com",""},
-  {"Twitter / X",   "shubhj@gmail.com",  "twitX!23",      "x.com",                 ""},
-  {"WhatsApp",      "+91 9876543210",    "wa_pin_2024",   "web.whatsapp.com",      ""},
-  {"Zerodha",       "shubhjaiswal",      "Zer0dha#24",    "kite.zerodha.com",      ""},
+  {"Demo Email",    "demo.user@example.invalid",  "Demo-Pass-0001!", "mail.example.invalid",   "Demo data"},
+  {"Demo Bank",     "demo.user@example.invalid",  "Demo-Pass-0002!", "bank.example.invalid",   "Demo data"},
+  {"Demo Shopping", "demo.user@example.invalid",  "Demo-Pass-0003!", "shop.example.invalid",   "Demo data"},
+  {"Demo Social",   "demo_handle",                "Demo-Pass-0004!", "social.example.invalid", "Demo data"},
+  {"Demo Work VPN", "demo.user@example.invalid",  "Demo-Pass-0005!", "vpn.example.invalid",    "Demo data"},
 };
 
 void dbSeed() {
-  if (FFat.exists(DB_PATH)) return;
-  Serial.println("[DB] Seeding demo passwords...");
+  if (dbExists()) return;
+  if (!vaultUnlocked) return;
+  dbCreateEmpty();
+  SK_LOGLN("[DB] SECUREKEY_DEMO_MODE: seeding fake demo entries (*.example.invalid)");
   const int N = sizeof(SEEDS) / sizeof(SEEDS[0]);
   for (int i = 0; i < N; i++) {
     PassRecord rec;
-    memset(&rec, 0, RECORD_SIZE);
+    memset(&rec, 0, sizeof(rec));
     rec.id      = (uint16_t)(i + 1);
     rec.deleted = 0;
-    // folder = URL (becomes the subtitle shown under the title)
     strncpy(rec.folder,   SEEDS[i].url,   sizeof(rec.folder)  - 1);
     strncpy(rec.title,    SEEDS[i].title, sizeof(rec.title)   - 1);
     strncpy(rec.username, SEEDS[i].user,  sizeof(rec.username)- 1);
@@ -200,6 +390,16 @@ void dbSeed() {
     strncpy(rec.url,      SEEDS[i].url,   sizeof(rec.url)     - 1);
     strncpy(rec.note,     SEEDS[i].note,  sizeof(rec.note)    - 1);
     dbAppend(rec);
+    ckSecureZero(&rec, sizeof(rec));
   }
-  Serial.printf("[DB] Seeded %d passwords.\n", N);
+  dbLoadIndex();
 }
+#else
+// Production build: no demo data is compiled in at all. If /db.bin
+// doesn't exist yet, just create an empty encrypted database.
+void dbSeed() {
+  if (dbExists()) return;
+  if (!vaultUnlocked) return;
+  dbCreateEmpty();
+}
+#endif

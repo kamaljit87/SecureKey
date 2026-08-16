@@ -161,9 +161,12 @@ arduino-cli compile \
 (`USBMode=default` is USB‑OTG/TinyUSB.) This is exactly what the [CI workflow](.github/workflows/build.yml) runs on every push.
 </details>
 
-### 5. Unlock
+### 5. First unlock
 
-Default PIN is **`1234`** — change it in **Settings → Change PIN**.
+There's no default PIN. First boot walks you through choosing your own PIN
+(4/6/8 digits — 6+ recommended), which is used to derive the key that
+protects your vault and is never itself stored on the device. See
+[docs/SECURITY.md](docs/SECURITY.md) for how this works.
 
 ---
 
@@ -262,24 +265,49 @@ The UI is hand‑drawn into a **double‑buffered canvas** in PSRAM and flushed 
 
 ## 🔐 Security model & honest limitations
 
+Full write‑up (threat model, cryptographic design, migration, and the exact
+ESP32‑S3 Flash Encryption / Secure Boot production steps) lives in
+**[docs/SECURITY.md](docs/SECURITY.md)**. Summary:
+
 **What it does today**
-- Vault is **offline** and PIN‑gated; the screen locks on idle and on the physical button.
-- Brute‑force PIN backoff persists across reboots.
+- Vault is **offline**, PIN‑gated, and **encrypted at rest**: every record is
+  AES‑256‑GCM with its own random nonce, under a random 256‑bit master key
+  that is itself wrapped by a PBKDF2‑HMAC‑SHA256‑derived key — never the PIN
+  directly, and the PIN is never stored anywhere, in any form.
+- The screen locks on idle and on the physical button; locking wipes the
+  master key from RAM, not just the display.
+- Brute‑force PIN backoff persists across reboots, on top of the real KDF
+  cost every guess pays regardless of that counter.
 - Bluetooth typing requires **explicit on‑device approval** per connection.
+- Factory reset destroys the old cryptographic identity entirely (new random
+  master key, new salt) — it can't be used to bypass the PIN and recover an
+  old vault.
+- An existing plaintext vault (pre‑encryption firmware) migrates
+  automatically on first boot of this firmware, with a verify‑before‑delete
+  step so the old data is never lost to a failed migration.
 
-**What it does *not* do yet** (PRs very welcome 🙏)
-- 🔓 The vault on flash is **not yet encrypted at rest**. A determined attacker with physical access and a flash reader could dump it. Roadmap: AES‑256 with a key derived from the PIN, plus ESP32 **Flash Encryption** + **Secure Boot v2**.
-- The default PIN is `1234` — change it.
+**What it does *not* do** (see SECURITY.md § Security limitations for the
+full list)
+- Optional **ESP32‑S3 Flash Encryption + Secure Boot v2** (whole‑flash /
+  firmware‑signing hardening on top of the above) is documented but **not
+  auto‑enabled** — it's a manual, explicit, one‑way eFuse step you run
+  yourself when you're ready for a production device, never something the
+  build or firmware does for you.
+- A compromised or *currently unlocked* device, sophisticated hardware
+  attacks (glitching, side‑channel), and firmware bugs elsewhere in the
+  codebase are outside what this (or any) microcontroller password manager
+  can fully defend against.
 
-Treat this as a **strong DIY / learning project**, not a certified security product. See the roadmap.
+Treat this as a **serious DIY / hobbyist‑grade hardened project**, not a
+certified security product — see the roadmap.
 
 ---
 
 ## 🛣️ Roadmap
 
 - [x] Touch UI, vault, USB + BLE HID, Wi‑Fi import, drag‑reorder
-- [ ] **AES‑256 encrypted vault** (key derived from PIN)
-- [ ] **Flash Encryption + Secure Boot v2** (one‑way fuses, release mode)
+- [x] **AES‑256‑GCM encrypted vault** (random master key, PBKDF2‑derived PIN wrapping — see [docs/SECURITY.md](docs/SECURITY.md))
+- [ ] **Flash Encryption + Secure Boot v2 enabled by default in a documented production build** (the steps are written up in SECURITY.md today; still a manual per‑device process, not yet a one‑command flow)
 - [ ] **TOTP / 2FA** code generator (HMAC‑SHA1)
 - [ ] **FIDO2 / WebAuthn** passkey (ECC P‑256)
 - [ ] Custom PCB + 3D‑printed enclosure

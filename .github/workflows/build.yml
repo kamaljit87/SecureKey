@@ -18,52 +18,58 @@ permissions:
 jobs:
 
   # ============================================================
-  # CodeQL SAST
+  # CodeQL SAST + Firmware Build
+  #
+  # CodeQL MUST observe the C/C++ compilation.
+  # Therefore init -> Arduino compile -> analyze all happen
+  # inside this same job.
   # ============================================================
   codeql:
     name: CodeQL SAST
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      security-events: write
+
     steps:
+      # --------------------------------------------------------
+      # Checkout
+      # --------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # --------------------------------------------------------
+      # Initialize CodeQL
+      # --------------------------------------------------------
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: cpp
+          build-mode: manual
           queries: security-extended
 
-      - name: Analyze
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:cpp"
-
-
-  # ============================================================
-  # Arduino / ESP32 Build
-  # ============================================================
-  compile:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
+      # --------------------------------------------------------
+      # Install Arduino CLI
+      # --------------------------------------------------------
       - name: Install arduino-cli
         run: |
-          # Pin to v0.35.3 — the last stable pre-1.0 release.
           curl -L -o /tmp/arduino-cli.tar.gz \
             https://github.com/arduino/arduino-cli/releases/download/v0.35.3/arduino-cli_0.35.3_Linux_64bit.tar.gz
 
           mkdir -p "$HOME/bin"
-          tar -xzf /tmp/arduino-cli.tar.gz -C "$HOME/bin"
+
+          tar -xzf \
+            /tmp/arduino-cli.tar.gz \
+            -C "$HOME/bin"
+
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
+      # --------------------------------------------------------
+      # Install ESP32 Arduino Core
+      # --------------------------------------------------------
       - name: Install ESP32 core 2.0.16
         run: |
           arduino-cli config init
@@ -75,6 +81,9 @@ jobs:
 
           arduino-cli core install esp32:esp32@2.0.16
 
+      # --------------------------------------------------------
+      # Install libraries
+      # --------------------------------------------------------
       - name: Install libraries (pinned)
         run: |
           arduino-cli lib install "NimBLE-Arduino@1.4.3"
@@ -86,10 +95,17 @@ jobs:
           arduino-cli lib install \
             --git-url https://github.com/T-vK/ESP32-BLE-Keyboard.git
 
+      # --------------------------------------------------------
+      # Install Makerfabs Arduino_GFX fork
+      # --------------------------------------------------------
       - name: Install Makerfabs Arduino_GFX fork
         run: |
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/Makerfabs/MaTouch-ESP32-S3-AMOLED-with-Touch-1.8-FT3168.git mf
+          git clone \
+            --depth 1 \
+            --filter=blob:none \
+            --sparse \
+            https://github.com/Makerfabs/MaTouch-ESP32-S3-AMOLED-with-Touch-1.8-FT3168.git \
+            mf
 
           git -C mf sparse-checkout set \
             "LVGL project/libraries/Arduino_GFX-1.3.7"
@@ -104,12 +120,32 @@ jobs:
             "06_PasswordManager/pin_config.h" \
             "$HOME/Arduino/libraries/Arduino_GFX/src/pin_config.h"
 
+      # --------------------------------------------------------
+      # Patch ESP32 BLE Keyboard
+      # --------------------------------------------------------
       - name: Patch ESP32 BLE Keyboard
         run: |
-          HDR="$(find "$HOME/Arduino/libraries" -name BleKeyboard.h | head -1)"
-          SRC="$(find "$HOME/Arduino/libraries" -name BleKeyboard.cpp | head -1)"
+          HDR="$(find "$HOME/Arduino/libraries" \
+            -name BleKeyboard.h \
+            | head -1)"
 
-          echo "Patching: $HDR / $SRC"
+          SRC="$(find "$HOME/Arduino/libraries" \
+            -name BleKeyboard.cpp \
+            | head -1)"
+
+          echo "Patching:"
+          echo "Header: $HDR"
+          echo "Source: $SRC"
+
+          if [ -z "$HDR" ]; then
+            echo "ERROR: BleKeyboard.h not found"
+            exit 1
+          fi
+
+          if [ -z "$SRC" ]; then
+            echo "ERROR: BleKeyboard.cpp not found"
+            exit 1
+          fi
 
           # Enable NimBLE backend.
           sed -i \
@@ -129,6 +165,23 @@ jobs:
             's|hidInfo(0x00, 0x01)|hidInfo(0x00, 0x03)|' \
             "$SRC"
 
+      # --------------------------------------------------------
+      # Show Arduino environment
+      # --------------------------------------------------------
+      - name: Show Arduino environment
+        run: |
+          arduino-cli version
+          arduino-cli core list
+          arduino-cli lib list
+
+      # --------------------------------------------------------
+      # Compile firmware
+      #
+      # IMPORTANT:
+      #
+      # This is AFTER CodeQL init and BEFORE CodeQL analyze.
+      # This allows CodeQL to observe the C/C++ compiler.
+      # --------------------------------------------------------
       - name: Compile firmware
         run: |
           rm -rf build
@@ -141,28 +194,49 @@ jobs:
           echo "Build output:"
           ls -lah build
 
+      # --------------------------------------------------------
+      # CodeQL Analysis
+      # --------------------------------------------------------
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:cpp"
+
+      # --------------------------------------------------------
+      # Copy firmware to firmware directory
+      # --------------------------------------------------------
       - name: Copy firmware to firmware directory
         if: github.event_name == 'push'
         run: |
           mkdir -p firmware
 
-          cp build/06_PasswordManager.ino.bin \
+          cp \
+            build/06_PasswordManager.ino.bin \
             firmware/06_PasswordManager.ino.bin
 
-          cp build/06_PasswordManager.ino.bootloader.bin \
+          cp \
+            build/06_PasswordManager.ino.bootloader.bin \
             firmware/06_PasswordManager.ino.bootloader.bin
 
-          cp build/06_PasswordManager.ino.partitions.bin \
+          cp \
+            build/06_PasswordManager.ino.partitions.bin \
             firmware/06_PasswordManager.ino.partitions.bin
-            
+
+          cp \
+            build/boot_app0.bin \
+            firmware/boot_app0.bin
+
           echo "Updated firmware:"
           ls -lah firmware
 
+      # --------------------------------------------------------
+      # Commit updated firmware
+      # --------------------------------------------------------
       - name: Commit updated firmware
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add firmware/
 

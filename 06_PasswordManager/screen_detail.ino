@@ -56,7 +56,14 @@ static void drawDetailRow(int16_t y, const char *label,
   gfx->print("TYPE");
 }
 
-void detailInit() { /* nothing to reset */ }
+// detailRec holds a DECRYPTED record — including the plaintext password —
+// for as long as this screen is on top. detailInit() clears any stale
+// copy before a fresh dbLoadRecord() in drawDetail(); detailWipe() is
+// called on every way OUT of this screen so the plaintext doesn't linger
+// in RAM once the user isn't looking at it (see docs/SECURITY.md,
+// "reduced plaintext residence time").
+void detailInit() { ckSecureZero(&detailRec, sizeof(detailRec)); }
+static void detailWipe() { ckSecureZero(&detailRec, sizeof(detailRec)); }
 
 void drawDetail() {
   if (!dbLoadRecord(detailId, detailRec)) {
@@ -171,6 +178,7 @@ static void confirmAndDelete() {
           // Delete!
           dbDelete(detailId);
           dbLoadIndex();
+          detailWipe();
           ledSet(0xFF0000, 300);
           // Confirmation
           gfx->fillScreen(C_BLACK);
@@ -196,6 +204,7 @@ void onTapDetail(int16_t tx, int16_t ty) {
   // Back (top-left)
   if (ty >= STATUS_H + 2 && ty < STATUS_H + NAV_H - 2
       && tx >= SAFE_PAD && tx < SAFE_PAD + 46) {
+    detailWipe();
     popNav(); return;
   }
 
@@ -204,6 +213,7 @@ void onTapDetail(int16_t tx, int16_t ty) {
     if (tx >= actX(0) && tx < actX(0) + ACT_W) {        // EDIT
       editingId = detailId;
       addEditInit(detailRec);
+      detailWipe();
       pushNav(SCR_ADD);
       return;
     }

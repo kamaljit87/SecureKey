@@ -1,18 +1,30 @@
 // =============================================================
-//  wifi_portal.ino  —  On-device WiFi captive-portal import
+//  wifi_portal.ino  —  On-device WiFi captive-portal import/export
 //
 //  The whole thing lives ON the device — no app, no hosting, no
 //  GitHub. The user just joins the device's WiFi and the page pops
 //  up (captive portal, like hotel WiFi), fills a form / pastes a
 //  CSV, and the device saves it straight into the vault.
 //
-//  Security (see also the on-screen Settings page):
-//    • Isolated SoftAP, internet-disconnected.
-//    • WPA2 with a fresh RANDOM password each session (shown only
-//      on the device screen).
-//    • A 6-digit on-screen CODE must be entered on the page before
-//      anything is saved.
-//    • Single client; auto-off after idle.
+//  ── Security boundary — treat this as untrusted network surface ──────
+//    • The portal can ONLY be started while the vault is UNLOCKED (the
+//      Settings menu that starts it is itself behind the PIN screen),
+//      and it is explicitly torn down (wifiPortalStop) the moment the
+//      user navigates away from the WiFi screen, on auto-lock, and on
+//      idle timeout — it can never be left silently running.
+//    • Every state-changing/data-revealing route (/save, /list, /edit,
+//      /delete, /export) requires the 6-digit on-screen CODE, which is
+//      freshly randomized every session and shown ONLY on the device's
+//      own display — never over serial, never in a log, never echoed
+//      back by the HTTP server.
+//    • ALL vault reads/writes here go through the same encrypted-DB API
+//      (dbLoadRecord/dbAppend/dbUpdate/dbDelete) as the on-device UI —
+//      there is no separate raw-file code path, so nothing here can see
+//      or write plaintext that bypasses AES-256-GCM at rest.
+//    • The SoftAP is isolated (no internet uplink), single-client, and
+//      auto-shuts-down after 3 minutes of no requests.
+//    • WPA2 with a fresh RANDOM password each session (shown only on the
+//      device screen — see the "never log" note by wifiPortalStart()).
 //
 //  Built-in libs only (WiFi / WebServer / DNSServer) — no deps.
 // =============================================================
@@ -28,8 +40,15 @@ static char       portalSsid[20] = "SecureKey-Setup";
 static char       portalPass[12] = {0};   // random WPA2 (8 chars)
 static char       portalCode[7]  = {0};   // 6-digit on-screen gate
 static uint32_t   portalLastSeen = 0;     // for idle auto-off
+static uint32_t   portalStartedAt = 0;    // for the hard session cap
 static int        portalImported = 0;     // running count (for the screen)
 static bool       portalNeedReload = false;
+
+// Hard cap on how long the portal can stay up in one session REGARDLESS of
+// request activity — bounds "device left unattended with the import screen
+// open and someone keeps poking it" to a fixed window, on top of the
+// idle-no-requests timeout below. Not adjustable at runtime.
+#define PORTAL_MAX_SESSION_MS   600000UL   // 10 minutes
 
 // ── Accessors for the Settings screen ────────────────────────────────
 bool        wifiPortalActive()   { return portalActive; }
@@ -39,9 +58,10 @@ const char* wifiPortalCode()     { return portalCode; }
 int         wifiPortalCount()    { return portalImported; }
 String      wifiPortalIp()       { return WiFi.softAPIP().toString(); }
 
-// ── Save one parsed entry (Arduino-task context — FFat safe) ─────────
+// ── Save one parsed entry (Arduino-task context — vault must be unlocked) ──
 static bool portalSaveEntry(const char *title, const char *user,
                             const char *pass, const char *url, uint16_t id) {
+  if (!vaultUnlocked) return false;
   // Title, username AND password are all mandatory — enforced server-side so
   // neither the form nor a bulk-import line can create half-empty entries.
   if (!title || !title[0]) return false;
@@ -54,7 +74,9 @@ static bool portalSaveEntry(const char *title, const char *user,
   strncpy(rec.password, pass ? pass : "", sizeof(rec.password) - 1);
   strncpy(rec.url,      url ? url : "",   sizeof(rec.url)      - 1);
   strncpy(rec.folder,   url ? url : "",   sizeof(rec.folder)   - 1);
-  return dbAppend(rec);
+  bool ok = dbAppend(rec);
+  ckSecureZero(&rec, sizeof(rec));   // imported plaintext wiped once written
+  return ok;
 }
 
 static uint16_t portalNextId() {
@@ -83,6 +105,7 @@ static void portalHandleSave() {
       "<a href='/' style='color:#4d9fff'>Back</a></body>");
     return;
   }
+  if (!vaultUnlocked) { portalSrv.send(423, "text/plain", "vault locked"); return; }
 
   uint16_t id = portalNextId();
   int added = 0;
@@ -118,9 +141,16 @@ static void portalHandleSave() {
       else           { title = f[0].c_str(); user = f[1].c_str(); pass = f[2].c_str(); url = f[3].c_str(); }
       if (portalSaveEntry(title, user, pass, url, id)) { id++; added++; }
     }
+    // The bulk paste (which may still contain plaintext passwords) lived in
+    // an Arduino String on the heap for the duration of this handler — clear
+    // it now rather than leaving it to whenever the allocator reuses the
+    // buffer.
+    for (size_t i = 0; i < bulk.length(); i++) bulk.setCharAt(i, '\0');
   } else {
-    if (portalSaveEntry(portalSrv.arg("title").c_str(), portalSrv.arg("user").c_str(),
-                        portalSrv.arg("pass").c_str(),  portalSrv.arg("url").c_str(), id)) added++;
+    String t = portalSrv.arg("title"), u = portalSrv.arg("user"),
+           p = portalSrv.arg("pass"),  w = portalSrv.arg("url");
+    if (portalSaveEntry(t.c_str(), u.c_str(), p.c_str(), w.c_str(), id)) added++;
+    for (size_t i = 0; i < p.length(); i++) p.setCharAt(i, '\0');
   }
 
   portalImported += added;
@@ -143,8 +173,13 @@ static void portalHandleNotFound() {
   portalSrv.send(302, "text/plain", "");
 }
 
-// ── Vault management routes (all gated on the 6-digit code) ───────────
-static bool portalCodeOk() { return portalSrv.arg("code") == String(portalCode); }
+// ── Vault management routes (all gated on the 6-digit code AND the vault
+//    being unlocked — the portal can only ever be started from an
+//    authenticated session, but this is checked again per-request since
+//    an idle-timeout auto-lock could fire mid-session). ───────────────
+static bool portalCodeOk() {
+  return vaultUnlocked && portalSrv.arg("code") == String(portalCode);
+}
 
 static String jsonEsc(const char *s) {
   String o;
@@ -166,29 +201,29 @@ static String csvField(const char *s) {
 }
 
 // GET /list?code=XXX  →  streamed JSON array of every entry.
+// Uses the same decrypt-one-record-at-a-time path as the on-device UI
+// (dbLoadRecord) — never a raw read of the encrypted file. Requires the
+// code AND an unlocked vault (see portalCodeOk), so the portal cannot
+// dump the vault before the user has authenticated on-device.
 static void portalHandleList() {
   portalLastSeen = millis();
   if (!portalCodeOk()) { portalSrv.send(403, "application/json", "[]"); return; }
   portalSrv.setContentLength(CONTENT_LENGTH_UNKNOWN);
   portalSrv.send(200, "application/json", "");
   portalSrv.sendContent("[");
-  File f = FFat.open(DB_PATH, "r");
   bool first = true;
-  if (f) {
+  for (uint16_t i = 0; i < passwordCount; i++) {
     PassRecord rec;
-    while (f.available() >= RECORD_SIZE) {
-      f.read((uint8_t *)&rec, RECORD_SIZE);
-      if (rec.deleted) continue;
-      String item = (first ? "" : ",");
-      first = false;
-      item += "{\"id\":" + String(rec.id)
-            + ",\"title\":\"" + jsonEsc(rec.title)    + "\""
-            + ",\"user\":\""  + jsonEsc(rec.username) + "\""
-            + ",\"pass\":\""  + jsonEsc(rec.password) + "\""
-            + ",\"url\":\""   + jsonEsc(rec.url)      + "\"}";
-      portalSrv.sendContent(item);
-    }
-    f.close();
+    if (!dbLoadRecord(passwordIndex[i].id, rec)) continue;
+    String item = (first ? "" : ",");
+    first = false;
+    item += "{\"id\":" + String(rec.id)
+          + ",\"title\":\"" + jsonEsc(rec.title)    + "\""
+          + ",\"user\":\""  + jsonEsc(rec.username) + "\""
+          + ",\"pass\":\""  + jsonEsc(rec.password) + "\""
+          + ",\"url\":\""   + jsonEsc(rec.url)      + "\"}";
+    portalSrv.sendContent(item);
+    ckSecureZero(&rec, sizeof(rec));
   }
   portalSrv.sendContent("]");
   portalSrv.sendContent("");
@@ -200,12 +235,16 @@ static void portalHandleEdit() {
   if (!portalCodeOk()) { portalSrv.send(403, "text/plain", "bad code"); return; }
   uint16_t id = (uint16_t)portalSrv.arg("id").toInt();
   PassRecord rec; memset(&rec, 0, sizeof(rec));
-  strncpy(rec.title,    portalSrv.arg("title").c_str(), sizeof(rec.title)    - 1);
-  strncpy(rec.username, portalSrv.arg("user").c_str(),  sizeof(rec.username) - 1);
-  strncpy(rec.password, portalSrv.arg("pass").c_str(),  sizeof(rec.password) - 1);
-  strncpy(rec.url,      portalSrv.arg("url").c_str(),   sizeof(rec.url)      - 1);
-  strncpy(rec.folder,   portalSrv.arg("url").c_str(),   sizeof(rec.folder)   - 1);
+  String t = portalSrv.arg("title"), u = portalSrv.arg("user"),
+         p = portalSrv.arg("pass"),  w = portalSrv.arg("url");
+  strncpy(rec.title,    t.c_str(), sizeof(rec.title)    - 1);
+  strncpy(rec.username, u.c_str(), sizeof(rec.username) - 1);
+  strncpy(rec.password, p.c_str(), sizeof(rec.password) - 1);
+  strncpy(rec.url,      w.c_str(), sizeof(rec.url)      - 1);
+  strncpy(rec.folder,   w.c_str(), sizeof(rec.folder)   - 1);
   bool ok = dbUpdate(id, rec);
+  ckSecureZero(&rec, sizeof(rec));
+  for (size_t i = 0; i < p.length(); i++) p.setCharAt(i, '\0');
   portalNeedReload = true;
   portalSrv.send(200, "text/plain", ok ? "ok" : "notfound");
 }
@@ -221,6 +260,7 @@ static void portalHandleDelete() {
 }
 
 // GET /export?code=XXX → streamed CSV download (title,username,password,url).
+// Same authenticated-decrypt-per-record path as /list.
 static void portalHandleExport() {
   portalLastSeen = millis();
   if (!portalCodeOk()) { portalSrv.send(403, "text/plain", "bad code"); return; }
@@ -228,17 +268,13 @@ static void portalHandleExport() {
   portalSrv.setContentLength(CONTENT_LENGTH_UNKNOWN);
   portalSrv.send(200, "text/csv", "");
   portalSrv.sendContent("title,username,password,url\n");
-  File f = FFat.open(DB_PATH, "r");
-  if (f) {
+  for (uint16_t i = 0; i < passwordCount; i++) {
     PassRecord rec;
-    while (f.available() >= RECORD_SIZE) {
-      f.read((uint8_t *)&rec, RECORD_SIZE);
-      if (rec.deleted) continue;
-      String line = csvField(rec.title) + "," + csvField(rec.username) + ","
-                  + csvField(rec.password) + "," + csvField(rec.url) + "\n";
-      portalSrv.sendContent(line);
-    }
-    f.close();
+    if (!dbLoadRecord(passwordIndex[i].id, rec)) continue;
+    String line = csvField(rec.title) + "," + csvField(rec.username) + ","
+                + csvField(rec.password) + "," + csvField(rec.url) + "\n";
+    portalSrv.sendContent(line);
+    ckSecureZero(&rec, sizeof(rec));
   }
   portalSrv.sendContent("");
 }
@@ -246,13 +282,25 @@ static void portalHandleExport() {
 // ── Public control ───────────────────────────────────────────────────
 void wifiPortalStart() {
   if (portalActive) return;
+  // Fail closed: never start the portal (and never expose vault routes)
+  // if the device somehow isn't unlocked. Settings is only reachable
+  // post-PIN, so this should be unreachable in normal use — defense in
+  // depth against a future navigation bug.
+  if (!vaultUnlocked) return;
 
-  // Fresh random WPA2 password + 6-digit code each session.
+  // Fresh random WPA2 password + 6-digit code each session. Uses
+  // ckRandomBytes() (the same HW-RNG wrapper used for every other secret
+  // in this project — crypto_core.cpp) rather than calling esp_random()
+  // directly, so there is exactly one RNG code path to audit.
   static const char *AZ = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";  // no confusing chars
-  for (int i = 0; i < 8; i++)  portalPass[i] = AZ[esp_random() % 31];
+  uint8_t rb[8];
+  ckRandomBytes(rb, sizeof(rb));
+  for (int i = 0; i < 8; i++)  portalPass[i] = AZ[rb[i] % 31];
   portalPass[8] = 0;
-  for (int i = 0; i < 6; i++)  portalCode[i] = '0' + (esp_random() % 10);
+  ckRandomBytes(rb, 6);
+  for (int i = 0; i < 6; i++)  portalCode[i] = '0' + (rb[i] % 10);
   portalCode[6] = 0;
+  ckSecureZero(rb, sizeof(rb));
   portalImported = 0; portalNeedReload = false;
 
   // ── Restart-bug mitigation ──────────────────────────────────────────
@@ -263,11 +311,11 @@ void wifiPortalStart() {
   //   2. The AP came up at full TX power (~19.5 dBm).
   // So: drop BLE first (restored in wifiPortalStop), and cap AP TX power —
   // the phone is inches away for a captive portal, it doesn't need full blast.
-  Serial.printf("[WIFI] pre-start heap: free=%u minfree=%u\n",
-                ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  SK_LOG("[WIFI] pre-start heap: free=%u minfree=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap());
   portalBleWasOn = settings.bleEnabled && hidBleCompiled() && hidBleStarted();
   if (portalBleWasOn) {
-    Serial.println("[WIFI] stopping BLE before AP (shared radio)");
+    SK_LOGLN("[WIFI] stopping BLE before AP (shared radio)");
     hidBleEnd();
     bleAuthorized = false;
     btConnected = false;
@@ -279,8 +327,8 @@ void wifiPortalStart() {
   WiFi.softAP(portalSsid, portalPass, 1, 0, 1);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);            // cut the current spike
   delay(100);
-  Serial.printf("[WIFI] post-start heap: free=%u minfree=%u\n",
-                ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  SK_LOG("[WIFI] post-start heap: free=%u minfree=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap());
   portalDns.start(53, "*", WiFi.softAPIP());     // all domains → us
 
   portalSrv.on("/",       HTTP_GET,  portalSendHtml);
@@ -292,9 +340,13 @@ void wifiPortalStart() {
   portalSrv.onNotFound(portalHandleNotFound);
   portalSrv.begin();
 
-  portalActive = true; portalLastSeen = millis();
-  Serial.printf("[WIFI] portal up: SSID=%s PASS=%s CODE=%s IP=%s\n",
-                portalSsid, portalPass, portalCode, WiFi.softAPIP().toString().c_str());
+  portalActive = true; portalLastSeen = millis(); portalStartedAt = millis();
+  // NEVER log the WPA2 password or the 6-digit access code — they are
+  // shown ONLY on the device's own display (screen_wifi.ino). Logging
+  // them here would defeat the "shown only on-device" security property
+  // documented at the top of this file.
+  SK_LOG("[WIFI] portal up: SSID=%s IP=%s (password/code shown on-device only)\n",
+         portalSsid, WiFi.softAPIP().toString().c_str());
 }
 
 void wifiPortalStop() {
@@ -304,31 +356,45 @@ void wifiPortalStop() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
   portalActive = false;
-  Serial.println("[WIFI] portal stopped");
+  SK_LOGLN("[WIFI] portal stopped");
 
   // Bring BLE back if we shut it down for the AP.
   if (portalBleWasOn && settings.bleEnabled && hidBleCompiled()) {
-    Serial.println("[WIFI] resuming BLE after AP");
+    SK_LOGLN("[WIFI] resuming BLE after AP");
     hidBleBegin();
   }
   portalBleWasOn = false;
 }
 
-// Call every loop(). Services the portal and auto-stops after idle.
+// Call every loop(). Services the portal and auto-stops after idle OR if
+// the vault has been locked from under it (auto-lock, idle timeout,
+// screen-off) — the portal must never keep running against a locked vault.
 void wifiPortalLoop() {
   if (!portalActive) return;
+
+  if (!vaultUnlocked) {
+    SK_LOGLN("[WIFI] vault locked — stopping portal");
+    wifiPortalStop();
+    return;
+  }
+
   portalDns.processNextRequest();
   portalSrv.handleClient();
 
   if (portalNeedReload) {           // a save happened — refresh the index
     portalNeedReload = false;
     dbLoadIndex();
-    Serial.printf("[WIFI] index reloaded (%u total)\n", passwordCount);
+    SK_LOG("[WIFI] index reloaded (%u total)\n", passwordCount);
   }
 
-  // Auto-off after 3 min of no requests (safety).
+  // Auto-off after 3 min of no requests (safety), or after the hard
+  // session cap regardless of activity (bounds an unattended-and-poked
+  // session to a fixed window — see PORTAL_MAX_SESSION_MS above).
   if (millis() - portalLastSeen > 180000UL) {
-    Serial.println("[WIFI] idle timeout — stopping portal");
+    SK_LOGLN("[WIFI] idle timeout — stopping portal");
+    wifiPortalStop();
+  } else if (millis() - portalStartedAt > PORTAL_MAX_SESSION_MS) {
+    SK_LOGLN("[WIFI] session cap reached — stopping portal");
     wifiPortalStop();
   }
 }

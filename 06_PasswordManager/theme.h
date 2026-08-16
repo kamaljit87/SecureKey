@@ -4,6 +4,34 @@
 #pragma once
 #include <Arduino.h>
 
+// ── Build-time security switches ───────────────────────────────
+// SECUREKEY_DEBUG: verbose/diagnostic serial logging. Even at 1, sensitive
+// values (passwords, PINs, keys, tokens) are NEVER printed — see the
+// "never log" list in docs/SECURITY.md. This only gates *extra* operational
+// logging (mount status, record counts, BLE state machine, etc). Set to 0
+// for anything you'd hand to someone else / a production unit.
+#ifndef SECUREKEY_DEBUG
+#define SECUREKEY_DEBUG 1
+#endif
+
+// SECUREKEY_DEMO_MODE: compiles in a handful of obviously-fake example
+// entries (example.invalid) for screenshots/UI dev, seeded into an EMPTY
+// vault only. Must be OFF for anything built to actually hold real
+// passwords. Define it in the .ino (or via a build flag) — never enabled
+// by default.
+// #define SECUREKEY_DEMO_MODE
+
+// Debug-gated serial helpers — use these instead of raw Serial.print* for
+// anything that isn't safety-critical (boot errors, fatal init failures
+// stay as plain Serial calls so they're visible even in release builds).
+#if SECUREKEY_DEBUG
+  #define SK_LOG(...)   Serial.printf(__VA_ARGS__)
+  #define SK_LOGLN(s)   Serial.println(s)
+#else
+  #define SK_LOG(...)   do {} while (0)
+  #define SK_LOGLN(s)   do {} while (0)
+#endif
+
 // ── Monochrome palette ───────────────────────────────────────
 #define C_BLACK    0x0000
 #define C_GRAY_1   0x10A2   // very dark   (card bg)
@@ -43,7 +71,7 @@ const uint8_t SEG7[10] = {
 // ── Screen states ─────────────────────────────────────────────
 enum Screen {
   SCR_LOCK,            // branded lock screen
-  SCR_PIN,             // 4-digit PIN
+  SCR_PIN,             // PIN entry (4/6/8 digits, per-device — see PIN_MIN_LEN/PIN_MAX_LEN)
   SCR_HOME,            // home grid (Passwords / Add / Flashlight / Settings)
   SCR_LIST,            // password list
   SCR_DETAIL,          // password detail
@@ -54,7 +82,9 @@ enum Screen {
   SCR_CHGPIN,          // change-PIN flow
   SCR_FLASH,           // flashlight (full white)
   SCR_WIFI,            // WiFi captive-portal import (shows AP credentials)
-  SCR_DEVICES          // saved BLE devices manager (whitelist)
+  SCR_DEVICES,         // saved BLE devices manager (whitelist)
+  SCR_SETUP_PIN,       // first-boot / post-factory-reset: choose a new PIN
+  SCR_MIGRATE          // one-time legacy-plaintext-DB → encrypted DB migration
 };
 
 // ── Password record (256 bytes fixed) ─────────────────────────
@@ -81,12 +111,19 @@ struct __attribute__((packed)) ListItem {
 static_assert(sizeof(ListItem) == 64, "ListItem must be 64 bytes");
 
 // ── Capacity ─────────────────────────────────────────────────
-//   Storage limit:   9 MB FATFS / 256 bytes    ≈ 36,000 records
+//   Storage limit:   9 MB FATFS / ~276 bytes (encrypted, see storage.ino
+//                    DB_RECORD_SIZE)         ≈ 33,000 records
 //   PSRAM index :    8 MB / 64 bytes           ≈ 130,000 records
 //   Cap at 30,000 — index uses 30000*64 ≈ 1.9 MB PSRAM + 30000*2
 //   for the sort array ≈ 60 KB, well within the 8 MB OPI PSRAM, and
-//   30000*256 = 7.3 MB fits the 9 MB FAT partition.
+//   comfortably fits the 9 MB FAT partition at the encrypted record size.
 #define MAX_PASSWORDS   30000
+
+// LEGACY plaintext (pre-encryption, SecureKey v1) on-disk record size —
+// kept ONLY so db_migrate.ino can recognize and safely convert an old
+// device's plaintext /db.bin. Never used to write anything in this
+// firmware; the live encrypted format's record size is DB_RECORD_SIZE
+// (storage.ino), which is larger (adds nonce/tag framing).
 #define RECORD_SIZE     256
 
 // ── Saved BLE devices (the "whitelist") ──────────────────────
@@ -102,12 +139,24 @@ struct __attribute__((packed)) SavedDevice {
 };
 
 // ── Settings stored in Preferences (NVS) ──────────────────────
+// NOTE: the PIN is intentionally NOT a field here. It never exists
+// anywhere except a transient stack buffer while the user is typing it
+// (see PIN_MAX_LEN below) — see vault_crypto.ino for the PBKDF2-derived
+// key-wrapping design that replaces "store the PIN and strcmp() it".
 struct UserSettings {
   uint8_t brightness;       // 20–250
   bool    bleEnabled;
   bool    usbHidEnabled;
-  char    pin[5];           // 4 digits + null
   uint8_t autoLockSec;      // 0=off, else 15/30/60/120 s idle → re-lock
                             // (screen stays ON — sleep modes were removed)
   bool    androidFix;       // swap @ / " keycodes for UK/Android BLE hosts
 };
+
+// PIN length: 4 digits kept as the supported minimum for backward
+// compatibility with existing devices/muscle memory, but PIN_MAX_LEN is
+// 8 so Settings → Change PIN can offer 6-digit (recommended) or longer.
+// Changing MIN below only affects the on-screen PIN-length picker — it
+// does not silently change any existing user's PIN.
+#define PIN_MIN_LEN  4
+#define PIN_MAX_LEN  8
+#define PIN_RECOMMENDED_LEN  6

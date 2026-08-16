@@ -9,10 +9,18 @@
 //
 //  To disable USB HID at compile time (no USB headers pulled in),
 //  set HID_USB_ENABLE to 0 below.
+//
+//  Media Controller compatibility note: same principle as hid_ble.cpp —
+//  a future USB consumer-control (volume/mute/play-pause/track) report
+//  path must be independent of vault lock state, calling TinyUSB's own
+//  consumer-control HID primitives directly rather than going through
+//  typeViaHID(). USB enumeration/mount state (tud_mounted) already has
+//  nothing to do with the vault, which is the property to preserve.
 // =============================================================
 #define HID_USB_ENABLE 1
 
 #include <Arduino.h>
+#include "theme.h"   // SK_LOG/SK_LOGLN (debug-gated logging) — header-only, safe here
 
 #if HID_USB_ENABLE
   #include <USB.h>
@@ -57,23 +65,26 @@ void hidUsbBegin() {
     // Exactly the pattern from the board's proven 04_USB_HID example:
     // Keyboard.begin() then USB.begin() — works with USB-OTG (TinyUSB) +
     // USB CDC On Boot = Enabled. No re-enumeration hack needed.
-    Serial.println("[USB] Keyboard.begin() + USB.begin()");
+    SK_LOGLN("[USB] Keyboard.begin() + USB.begin()");
     kb.begin();
     USB.begin();
     started = true;
     // Short delay here only — full mount wait happens in hidUsbPrint()
     // where we can actually report progress.  Setup() stays fast.
     delay(300);
-    Serial.printf("[USB] HID started  mounted=%d\n", tud_mounted() ? 1 : 0);
+    SK_LOG("[USB] HID started  mounted=%d\n", tud_mounted() ? 1 : 0);
   }
 #endif
 }
 
+// NEVER log `s` — it is frequently a password (called directly with the
+// decrypted PassRecord.password from screen_detail.ino). Only its length
+// and transport/state flags are logged, and only in debug builds.
 void hidUsbPrint(const char *s) {
 #if HID_USB_ENABLE
-  Serial.printf("[USB] hidUsbPrint('%s')  started=%d\n", s, started);
+  SK_LOG("[USB] hidUsbPrint() len=%d  started=%d\n", (int)strlen(s), started);
   if (!started) {
-    Serial.println("[USB]   not started — calling begin()");
+    SK_LOGLN("[USB]   not started — calling begin()");
     hidUsbBegin();
   }
 
@@ -81,26 +92,26 @@ void hidUsbPrint(const char *s) {
   // tud_mounted() is 0 for up to 1500ms on Windows after USB.begin().
   // The old code had no wait — keys were dropped every time.
   if (!tud_mounted()) {
-    Serial.printf("[USB]   not mounted yet — waiting up to %ums...\n", MOUNT_WAIT_MS);
+    SK_LOG("[USB]   not mounted yet — waiting up to %ums...\n", MOUNT_WAIT_MS);
     uint32_t t = millis();
     while (!tud_mounted() && (millis() - t) < MOUNT_WAIT_MS) {
       delay(50);
     }
     if (!tud_mounted()) {
-      Serial.println("[USB]   ERROR: host never mounted. Check:");
-      Serial.println("[USB]     1. Tools -> USB Mode = USB-OTG (TinyUSB)");
-      Serial.println("[USB]     2. USB CDC On Boot = Enabled");
-      Serial.println("[USB]     3. Data cable (not charge-only)");
+      SK_LOGLN("[USB]   ERROR: host never mounted. Check:");
+      SK_LOGLN("[USB]     1. Tools -> USB Mode = USB-OTG (TinyUSB)");
+      SK_LOGLN("[USB]     2. USB CDC On Boot = Enabled");
+      SK_LOGLN("[USB]     3. Data cable (not charge-only)");
       return;
     }
-    Serial.printf("[USB]   mounted after %ums\n", millis() - t);
+    SK_LOG("[USB]   mounted after %lums\n", millis() - t);
   }
 
   // Per-char so the Android @ fix can swap @ / " when enabled (a plain
   // kb.print(s) sends raw US scancodes with no swap).
-  Serial.printf("[USB]   typing %d chars...\n", (int)strlen(s));
+  SK_LOG("[USB]   typing %d chars...\n", (int)strlen(s));
   for (const char *p = s; *p; p++) usbType(*p);
-  Serial.println("[USB]   done");
+  SK_LOGLN("[USB]   done");
 #else
   (void)s;
 #endif
@@ -119,13 +130,14 @@ void hidUsbQuickFill(const char *user, const char *pass) {
       delay(50);
     }
     if (!tud_mounted()) {
-      Serial.println("[USB] quickFill: host not mounted — aborted");
+      SK_LOGLN("[USB] quickFill: host not mounted — aborted");
       return;
     }
   }
 
   // Per-char (via usbType) so the Android @ fix applies to user + pass too.
-  Serial.printf("[USB] quickFill user='%s'\n", user);
+  // NEVER log `user`/`pass` — see hidUsbPrint() above.
+  SK_LOGLN("[USB] quickFill start");
   for (const char *p = user; *p; p++) usbType(*p);
   delay(80);
   kb.write(KEY_TAB);
@@ -133,7 +145,7 @@ void hidUsbQuickFill(const char *user, const char *pass) {
   for (const char *p = pass; *p; p++) usbType(*p);
   delay(80);
   kb.write(KEY_RETURN);
-  Serial.println("[USB]   quickFill done");
+  SK_LOGLN("[USB]   quickFill done");
 #else
   (void)user; (void)pass;
 #endif

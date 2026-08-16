@@ -179,8 +179,11 @@ static void drawAbout() {
   drawNavBar("About", true, nullptr);
 
   // Real capacity: whichever is smaller — the firmware index cap or how
-  // many 256-byte records actually fit in the FFat partition.
-  uint32_t fitStore = (uint32_t)(FFat.totalBytes() / RECORD_SIZE);
+  // many on-disk encrypted records actually fit in the FFat partition.
+  // (DB_RECORD_SIZE — defined in storage.ino — includes the per-record
+  // nonce/tag framing, so this is the real on-disk footprint, not the
+  // old plaintext RECORD_SIZE.)
+  uint32_t fitStore = (uint32_t)(FFat.totalBytes() / DB_RECORD_SIZE);
   uint32_t capacity = fitStore < (uint32_t)MAX_PASSWORDS ? fitStore
                                                          : (uint32_t)MAX_PASSWORDS;
 
@@ -238,8 +241,10 @@ static void drawResetGate(const char *buf, uint8_t len) {
   textCenter(STATUS_H + NAV_H + 10, "Enter PIN to confirm", 2, C_WHITE);
 
   int16_t cx = LCD_WIDTH / 2, dy = STATUS_H + NAV_H + 46;
-  for (int i = 0; i < 4; i++) {
-    int16_t x = cx - 54 + i * 36;
+  uint8_t need = pinDisplayLen();
+  int16_t spacing = (need > 6) ? 26 : 36;
+  for (int i = 0; i < need; i++) {
+    int16_t x = cx - (spacing * (need - 1)) / 2 + i * spacing;
     if (i < len) gfx->fillCircle(x, dy, 9, C_WHITE);
     else         gfx->drawCircle(x, dy, 9, C_GRAY_3);
   }
@@ -263,8 +268,13 @@ static void drawResetGate(const char *buf, uint8_t len) {
   flushScreen();
 }
 
+// Verifies against the LIVE unlocked session (vaultVerifyPin) — same
+// reasoning as screen_chgpin.ino: a wrong re-entry here must only fail
+// this gate, never disturb the master key already held in RAM for this
+// unlocked session.
 static bool settingsAskPin() {
-  char buf[5] = {0}; uint8_t len = 0;
+  char buf[PIN_MAX_LEN + 1] = {0}; uint8_t len = 0;
+  uint8_t need = pinDisplayLen();
   for (;;) {
     drawResetGate(buf, len);
     int16_t tx, ty;
@@ -273,6 +283,7 @@ static bool settingsAskPin() {
     // Back arrow → cancel
     if (ty >= STATUS_H + 2 && ty < STATUS_H + NAV_H - 2
         && tx >= SAFE_PAD && tx < SAFE_PAD + 46) {
+      ckSecureZero(buf, sizeof(buf));
       return false;
     }
     // Which key?
@@ -282,17 +293,18 @@ static bool settingsAskPin() {
       if (tx < x || tx >= x + RG_W || ty < y || ty >= y + RG_H) continue;
       const char *k = RG_KEYS[i];
       if (strcmp(k, "BS") == 0) {
-        if (len) buf[--len] = 0;
+        if (len) { buf[--len] = 0; }
       } else if (strcmp(k, "OK") == 0) {
-        // require 4 digits — handled by the auto-check below
-      } else if (len < 4) {
+        // require `need` digits — handled by the auto-check below
+      } else if (len < need) {
         buf[len++] = k[0]; buf[len] = 0;
       }
-      if (len == 4) {
-        buf[4] = 0;
-        if (strcmp(buf, settings.pin) == 0) { ledSet(0x00FF00, 200); return true; }
+      if (len == need) {
+        buf[need] = 0;
+        bool ok = vaultVerifyPin(buf);
+        ckSecureZero(buf, sizeof(buf)); len = 0;
+        if (ok) { ledSet(0x00FF00, 200); return true; }
         ledSet(0xFF0000, 400);             // wrong — clear and retry
-        len = 0; buf[0] = 0;
       }
       break;
     }
@@ -332,14 +344,43 @@ static bool confirmErase() {
   }
 }
 
+// Factory reset must destroy EVERY piece of the old cryptographic identity
+// — not just the encrypted database file, but also:
+//   • the "skcrypt" NVS namespace (salt, wrapped master key, KDF params,
+//     PIN length metadata) — vaultCryptoErase()
+//   • the "skset" NVS namespace (UI settings + the persisted PIN-fail
+//     counter — a stale counter surviving a reset could otherwise start
+//     the NEW PIN's very first attempts already inside a lockout window)
+//   • saved BLE bonds — an old bonded phone should not be able to
+//     reconnect and auto-approve against a device that is, from the
+//     user's perspective, now a "new" device
+// A reset that left any of these behind would let someone reset PAST the
+// PIN and still recover old key material or old trusted-BLE-peer status —
+// exactly the "unintended PIN bypass" this project must not allow. After
+// this, setup() on reboot sees vaultCryptoProvisioned()==false and routes
+// to SCR_SETUP_PIN, generating a BRAND NEW random master key unrelated to
+// the old one.
 static void factoryReset() {
   if (!settingsAskPin()) { drawSettings(); return; }   // cancelled
   if (!confirmErase())   { drawSettings(); return; }
 
+  // Drop any BLE bonds first (best-effort — still proceeds if BLE is off).
+  if (hidBleCompiled()) hidBleForget();
+
   // Wipe the entire FFat filesystem (format is guaranteed; simple remove can
-  // fail silently if a file handle is still open or FAT is corrupted).
+  // fail silently if a file handle is still open or FAT is corrupted). This
+  // removes the encrypted /db.bin — there is nothing to "securely erase"
+  // beyond a normal format, since without the (about to be destroyed)
+  // master key its ciphertext is already unrecoverable.
   FFat.end();
   FFat.format();
+
+  // Destroy the crypto identity: salt, wrapped master key, KDF params, PIN
+  // length. This is what makes the reset a REAL new identity rather than
+  // "same key, empty file".
+  vaultCryptoErase();
+
+  // Clear UI settings + the persisted PIN-fail counter.
   prefs.begin("skset", false);
   prefs.clear();
   prefs.end();

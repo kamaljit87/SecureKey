@@ -9,10 +9,27 @@
 //
 //  Disable here if the library isn't installed:
 //      set HID_BLE_ENABLE 0
+//
+//  ── Media Controller compatibility note ───────────────────────
+//  Vault-gated typing (bleAuthorized / typeViaHID in the main .ino) is
+//  layered ON TOP of this file's connection/advertising primitives
+//  (hidBleBegin/hidBleConnected/kb.isConnected), not mixed into them.
+//  hidBleBegin() keeps the BLE radio advertising/connectable regardless
+//  of the vault's lock state — only the PASSWORD-typing calls
+//  (hidBlePrint/hidBleQuickFill) are gated by bleAuthorized, which is
+//  itself only ever set true from the post-unlock Accept gate. A future
+//  media-control HID report path (volume/mute/play-pause/track-skip)
+//  should call BleKeyboard's consumer-control report primitives directly,
+//  the same way this file calls its keyboard-report primitives — it must
+//  NOT be routed through typeViaHID()/bleAuthorized, and must NOT require
+//  vaultUnlocked. That keeps "media controls work while locked" true by
+//  construction rather than by a special-case check sprinkled through the
+//  vault-typing path.
 // =============================================================
 #define HID_BLE_ENABLE 1
 
 #include <Arduino.h>
+#include "theme.h"   // SK_LOG/SK_LOGLN (debug-gated logging) — header-only, safe here
 
 #if HID_BLE_ENABLE
   #include <BleKeyboard.h>
@@ -143,7 +160,7 @@ void hidBleForget() {
 #if HID_BLE_ENABLE
   NimBLEDevice::deleteAllBonds();
   everConn = false;
-  Serial.println("[BLE] all bonds cleared — pair fresh on the host");
+  SK_LOGLN("[BLE] all bonds cleared — pair fresh on the host");
 #endif
 }
 
@@ -164,7 +181,7 @@ void hidBleSetAndroidFix(int on) {
 void hidBleBegin() {
 #if HID_BLE_ENABLE
   if (!everStarted) {
-    Serial.println("[BLE] kb.begin() (first start)");
+    SK_LOGLN("[BLE] kb.begin() (first start)");
     kb.setDelay(5);     // 5 ms between key reports (library internal)
     kb.begin();
     everStarted = true;
@@ -178,9 +195,9 @@ void hidBleBegin() {
     // just added a 500 ms reconnect gap and log spam.) The "requests keep
     // coming" worry is now handled by auto-approve for saved devices + the
     // gate snooze for the rest.
-    Serial.println("[BLE] advertising as 'SecureKey'");
+    SK_LOGLN("[BLE] advertising as 'SecureKey'");
   } else if (!active) {
-    Serial.println("[BLE] resume advertising");
+    SK_LOGLN("[BLE] resume advertising");
     NimBLEDevice::getAdvertising()->start();
     active = true;
   }
@@ -191,7 +208,7 @@ void hidBleEnd() {
 #if HID_BLE_ENABLE
   everConn = false;                  // next connection re-arms the settle wait
   if (!everStarted || !active) { active = false; return; }
-  Serial.println("[BLE] stop: drop peers + stop advertising");
+  SK_LOGLN("[BLE] stop: drop peers + stop advertising");
   NimBLEServer *srv = NimBLEDevice::getServer();
   if (srv) {
     std::vector<uint16_t> peers = srv->getPeerDevices();
@@ -222,18 +239,21 @@ void hidBleReadvertise() {
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   if (adv && !adv->isAdvertising()) {
     adv->start();
-    Serial.println("[BLE] re-advertising (post-disconnect, we own advertising)");
+    SK_LOGLN("[BLE] re-advertising (post-disconnect, we own advertising)");
   }
 #endif
 }
 
+// NEVER log `s` — it is frequently a password (called directly with the
+// decrypted PassRecord.password from screen_detail.ino). Only its length
+// and connection-state flags are logged, and only in debug builds.
 void hidBlePrint(const char *s) {
 #if HID_BLE_ENABLE
-  Serial.printf("[BLE] hidBlePrint('%s')  active=%d  connected=%d\n",
-                s, active, everStarted ? (int)kb.isConnected() : 0);
-  if (!active) { Serial.println("[BLE]   not active — begin()"); hidBleBegin(); delay(500); }
+  SK_LOG("[BLE] hidBlePrint() len=%d  active=%d  connected=%d\n",
+         (int)strlen(s), active, everStarted ? (int)kb.isConnected() : 0);
+  if (!active) { SK_LOGLN("[BLE]   not active — begin()"); hidBleBegin(); delay(500); }
   if (!kb.isConnected()) {
-    Serial.println("[BLE]   isConnected()=false — aborting print");
+    SK_LOGLN("[BLE]   isConnected()=false — aborting print");
     return;
   }
   // Settle: the FIRST type on a fresh link waits for the host to subscribe to
@@ -243,22 +263,23 @@ void hidBlePrint(const char *s) {
   delay(everConn ? 60 : BLE_SETTLE_MS);
   everConn = true;
   int n = strlen(s);
-  Serial.printf("[BLE]   sending %d chars...\n", n);
+  SK_LOG("[BLE]   sending %d chars...\n", n);
   kb.releaseAll();                 // make sure nothing is held before we start
   delay(BLE_GAP_MS);
   for (int i = 0; i < n; i++) bleType(s[i]);
   kb.releaseAll();                 // final safety key-up
-  Serial.println("[BLE]   done");
+  SK_LOGLN("[BLE]   done");
 #else
   (void)s;
 #endif
 }
 
-// One-tap login over BLE: username, Tab, password, Enter.
+// One-tap login over BLE: username, Tab, password, Enter. NEVER log
+// `user`/`pass` — see hidBlePrint() above.
 void hidBleQuickFill(const char *user, const char *pass) {
 #if HID_BLE_ENABLE
   if (!active || !kb.isConnected()) {
-    Serial.println("[BLE] quickFill aborted — not connected");
+    SK_LOGLN("[BLE] quickFill aborted — not connected");
     return;
   }
   delay(everConn ? 60 : BLE_SETTLE_MS);
@@ -270,7 +291,7 @@ void hidBleQuickFill(const char *user, const char *pass) {
   for (const char *p = pass; *p; p++) bleType(*p);
   bleRawKey(KEY_RETURN);
   kb.releaseAll();
-  Serial.println("[BLE]   quickFill done");
+  SK_LOGLN("[BLE]   quickFill done");
 #else
   (void)user; (void)pass;
 #endif
@@ -383,7 +404,7 @@ int hidBleCapturePeer(char *ota, int otaN, char *id, int idN,
 void hidBleForgetOne(const char *addr, int type) {
 #if HID_BLE_ENABLE
   NimBLEDevice::deleteBond(NimBLEAddress(std::string(addr), (uint8_t)type));
-  Serial.printf("[BLE] bond deleted for %s\n", addr);
+  SK_LOG("[BLE] bond deleted\n");
 #else
   (void)addr; (void)type;
 #endif
@@ -400,7 +421,7 @@ void hidBleDisconnectPeer() {
   for (uint16_t id : peers) srv->disconnect(id);
   if (!peers.empty()) delay(200);
   everConn = false;
-  Serial.println("[BLE] peer kicked (advertising continues for other devices)");
+  SK_LOGLN("[BLE] peer kicked (advertising continues for other devices)");
 #endif
 }
 

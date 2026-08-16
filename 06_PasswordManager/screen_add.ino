@@ -27,7 +27,7 @@ static const char *FIELD_HINTS[5] = {
 
 // ── Reset state before entering Add screen ───────────────────
 void addInit() {
-  memset(&addRec, 0, sizeof(addRec));
+  ckSecureZero(&addRec, sizeof(addRec));
   addField = 0;
   kbReset();
 }
@@ -71,6 +71,11 @@ static void loadFromField(uint8_t f) {
 }
 
 // ── Save the new record and return to list ───────────────────
+// Goes through the same encrypted-DB API (dbAppend/dbUpdate) the rest of
+// the app uses — no raw FFat file access here, so a new/edited record is
+// always AES-256-GCM encrypted with its own fresh nonce before it ever
+// touches flash. NEVER logs field contents (title/user/pass/url can all
+// be sensitive).
 static void saveNewRecord() {
   if (editingId == 0) {
     // New — pick next id
@@ -79,28 +84,11 @@ static void saveNewRecord() {
       if (passwordIndex[i].id > maxId) maxId = passwordIndex[i].id;
     addRec.id      = maxId + 1;
     addRec.deleted = 0;
-    Serial.printf("[ADD] Saving new id=%u title='%s' user='%s' pass='%s' url='%s'\n",
-                  addRec.id, addRec.title, addRec.username,
-                  addRec.password, addRec.url);
+    SK_LOG("[ADD] saving new record id=%u\n", addRec.id);
     dbAppend(addRec);
   } else {
-    // Edit — rewrite db replacing the matching record
-    File src = FFat.open("/db.bin", "r");
-    File dst = FFat.open("/db_tmp.bin", "w");
-    PassRecord rec;
-    while (src.available() >= RECORD_SIZE) {
-      src.read((uint8_t *)&rec, RECORD_SIZE);
-      if (rec.id == editingId) {
-        addRec.id      = editingId;
-        addRec.deleted = 0;
-        dst.write((uint8_t *)&addRec, RECORD_SIZE);
-      } else {
-        dst.write((uint8_t *)&rec, RECORD_SIZE);
-      }
-    }
-    src.close(); dst.close();
-    FFat.remove("/db.bin");
-    FFat.rename("/db_tmp.bin", "/db.bin");
+    SK_LOG("[ADD] updating record id=%u\n", editingId);
+    dbUpdate(editingId, addRec);
   }
   dbLoadIndex();
   ledSet(0x00FF00, 350);
@@ -146,9 +134,10 @@ void addNextField() {
     // Fully close the add/edit flow: clear the form, the keyboard, the edit
     // target and the whole nav stack, and land on a clean Home screen. (Was
     // dropping onto the Passwords list; per request, saving now closes
-    // everything out.)
+    // everything out.) addRec/kbBuffer held a plaintext password during
+    // this whole flow — securely wipe both now that they're saved.
     addField = 0;
-    memset(&addRec, 0, sizeof(addRec));
+    ckSecureZero(&addRec, sizeof(addRec));
     kbReset();
     editingId      = 0;
     listSearchMode = false;
@@ -217,8 +206,28 @@ void drawAdd() {
   // (progress dots removed — the nav bar already shows the "N/5" step,
   //  and the taller grid keyboard now needs that vertical space)
 
-  // Suggestions just above keyboard (only for non-password fields)
-  if (addField != 2) kbDrawSuggestions(KB_TOP_Y - 36);
+  // Suggestions just above keyboard (only for non-password fields).
+  // The PASSWORD field gets a GENERATE button in that same slot instead —
+  // draws a cryptographically random password (pwgen.ino, HW RNG) straight
+  // into the field, which the user can still edit afterward.
+  if (addField != 2) {
+    kbDrawSuggestions(KB_TOP_Y - 36);
+  } else {
+    int16_t gy = KB_TOP_Y - 36;
+    int16_t gx = SAFE_PAD, gw = LCD_WIDTH - 2*SAFE_PAD;
+    int16_t lenW = 64;
+    int16_t genW = gw - lenW - 8;
+    // GENERATE (left, wide) + tap-to-cycle length (right, narrow: 12/16/20/24)
+    gfx->fillRoundRect(gx, gy, genW, 30, 8, C_GRAY_1);
+    gfx->drawRoundRect(gx, gy, genW, 30, 8, C_BLUE);
+    textCenter(gy + 8, "GENERATE PASSWORD", 1, C_BLUE);
+
+    int16_t lx = gx + genW + 8;
+    gfx->fillRoundRect(lx, gy, lenW, 30, 8, C_GRAY_1);
+    gfx->drawRoundRect(lx, gy, lenW, 30, 8, C_GRAY_3);
+    char lb[8]; snprintf(lb, sizeof(lb), "%u", pwgenOpts.length);
+    textCenter(gy + 8, lb, 1, C_WHITE, lx + lenW/2);
+  }
 
   kbDraw(KB_TOP_Y);
   flushScreen();
@@ -243,6 +252,36 @@ void onTapAdd(int16_t tx, int16_t ty) {
   if (addField != 2 && kbHandleSuggestionTap(tx, ty, KB_TOP_Y - 36)) {
     drawAdd();
     return;
+  }
+  // GENERATE + length-cycle controls (password field only, same slot as
+  // the suggestions row on other fields).
+  if (addField == 2) {
+    int16_t gy = KB_TOP_Y - 36;
+    int16_t gx = SAFE_PAD, gw = LCD_WIDTH - 2*SAFE_PAD;
+    int16_t lenW = 64;
+    int16_t genW = gw - lenW - 8;
+    int16_t lx = gx + genW + 8;
+
+    if (ty >= gy && ty < gy + 30) {
+      if (tx >= gx && tx < gx + genW) {              // GENERATE
+        char generated[PWGEN_MAX_LEN + 1];
+        pwgenGenerate(generated, pwgenOpts);
+        strncpy(kbBuffer, generated, KB_MAX_LEN);
+        kbBuffer[KB_MAX_LEN] = 0;
+        kbLen = (uint8_t)strlen(kbBuffer);
+        ckSecureZero(generated, sizeof(generated));
+        ledSet(0x0000FF, 150);
+        drawAdd();
+        return;
+      }
+      if (tx >= lx && tx < lx + lenW) {               // cycle length
+        pwgenOpts.length = (pwgenOpts.length == 12) ? 16
+                          : (pwgenOpts.length == 16) ? 20
+                          : (pwgenOpts.length == 20) ? 24 : 12;
+        drawAdd();
+        return;
+      }
+    }
   }
   if (kbHandleTap(tx, ty)) drawAdd();
 }
