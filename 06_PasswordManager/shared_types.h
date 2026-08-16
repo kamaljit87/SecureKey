@@ -133,3 +133,11 @@ struct PwGenOptions {
   bool    digits;
   bool    symbols;
 };
+
+// ── screen_media.ino's button hit-rect ──────────────────────────────────
+// Same hoisting reason as everything else in this header: several static
+// helpers in screen_media.ino return this by value (mcVolDownRect() etc.),
+// which needs the type visible before Arduino's auto-generated prototypes.
+struct McRect {
+  int16_t x, y, w, h;
+};

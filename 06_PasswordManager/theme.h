@@ -84,7 +84,9 @@ enum Screen {
   SCR_WIFI,            // WiFi captive-portal import (shows AP credentials)
   SCR_DEVICES,         // saved BLE devices manager (whitelist)
   SCR_SETUP_PIN,       // first-boot / post-factory-reset: choose a new PIN
-  SCR_MIGRATE          // one-time legacy-plaintext-DB → encrypted DB migration
+  SCR_MIGRATE,         // one-time legacy-plaintext-DB → encrypted DB migration
+  SCR_MEDIA            // media/volume controller — the default "resting" screen
+                        // (vault stays LOCKED here; see media_control.ino)
 };
 
 // ── Password record (256 bytes fixed) ─────────────────────────

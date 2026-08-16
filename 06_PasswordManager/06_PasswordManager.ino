@@ -60,6 +60,18 @@ extern "C" {
   void hidBleReadvertise();           // restart advertising after a disconnect
   void hidBleReturn();                // send Return key over BLE
   void hidUsbReturn();                // send Return key over USB
+
+  // Consumer Control (media key) HID — see media_control.ino for the
+  // transport-agnostic mediaVolumeUp()/etc. wrappers built on top of these.
+  // Deliberately independent of vaultUnlocked/bleAuthorized: media keys work
+  // whether the vault is locked or not, same as any standalone BT/USB remote.
+  void hidConsumerUsbBegin();
+  int  hidConsumerUsbReady();          // 1 once the USB host has enumerated us
+  int  hidConsumerUsbCompiled();
+  void hidConsumerUsbMediaKey(int code);
+
+  int  hidBleMediaReady();             // 1 once a BLE HID host is connected
+  void hidBleMediaKey(int code);
 }
 
 #include <Arduino.h>
@@ -262,6 +274,7 @@ void drawFlash();     void onTapFlash(int16_t,int16_t);
 void drawDevices();   void onTapDevices(int16_t,int16_t);   void devicesInit();
 void drawSetupPin();  void onTapSetupPin(int16_t,int16_t);
 void drawMigrate();   void onTapMigrate(int16_t,int16_t);
+void drawMedia();     void onTapMedia(int16_t,int16_t);
 void drawAll();
 
 // pwgen.ino (password generator, HW RNG) is textually ordered before
@@ -341,6 +354,7 @@ void drawAll() {
     case SCR_DEVICES:     drawDevices();   break;
     case SCR_SETUP_PIN:   drawSetupPin();  break;
     case SCR_MIGRATE:     drawMigrate();   break;
+    case SCR_MEDIA:       drawMedia();     break;
     default:                               break;
   }
 }
@@ -366,6 +380,7 @@ void dispatchTap(int16_t tx, int16_t ty) {
     case SCR_DEVICES:     onTapDevices(tx, ty);    break;
     case SCR_SETUP_PIN:   onTapSetupPin(tx, ty);   break;
     case SCR_MIGRATE:     onTapMigrate(tx, ty);    break;
+    case SCR_MEDIA:       onTapMedia(tx, ty);      break;
     default:                                       break;
   }
 }
@@ -407,14 +422,21 @@ void popNav() {
 // storage.ino) is also dropped so a locked device holds nothing more
 // than non-sensitive labels, and those only until the next dbLoadIndex()
 // on re-unlock.
+//
+// Lands on SCR_MEDIA, not SCR_LOCK: the Media Control screen is the
+// device's default "resting" screen once a vault exists (see setup()) —
+// SCR_LOCK (the branded tap-to-unlock splash) is still reachable from
+// Media's "Passwords" button, but is no longer where an auto-lock/timeout
+// drops you. The vault is fully locked either way; only the screen shown
+// changes. See media_control.ino for why media controls stay usable here.
 void popToLock() {
   homeExitReorder();         // never leave the home in arrange mode
   vaultLock();
   passwordCount = 0;
   ckSecureZero(pinEntry, sizeof(pinEntry));
   navTop = 0;
-  navStack[0] = SCR_LOCK;
-  current = SCR_LOCK;
+  navStack[0] = SCR_MEDIA;
+  current = SCR_MEDIA;
   pinLen = 0;
   drawAll();
 }
@@ -825,6 +847,11 @@ void setup() {
   // init *order* still matters — USB first, BLE last.  Always-on USB HID
   // costs ~5 mA which is acceptable for a wired/charging device.
   if (hidUsbCompiled()) hidUsbBegin();
+  // Consumer Control (media keys) is a second, independent composite-HID
+  // report registered alongside the keyboard — see hid_consumer_usb.cpp.
+  // Always started (media controls work regardless of the usbHidEnabled
+  // keyboard-typing setting, same as BLE's media path — see media_control.ino).
+  if (hidConsumerUsbCompiled()) hidConsumerUsbBegin();
 
   loadSettings();
   devsLoad();                      // restore the saved BLE devices whitelist
@@ -897,10 +924,14 @@ void setup() {
   //   • no crypto identity yet (brand new device)      → SCR_SETUP_PIN
   //   • legacy plaintext /db.bin found (upgraded fw)    → SCR_SETUP_PIN,
   //     which chains into SCR_MIGRATE once a new PIN is chosen
-  //   • normal case                                     → SCR_LOCK
+  //   • normal case                                     → SCR_MEDIA
+  //       (the media/volume controller — see media_control.ino / screen_
+  //       media.ino. It's the default "resting" screen for an already-
+  //       provisioned device; tapping "Passwords" there enters the
+  //       existing SCR_LOCK → swipe-up → SCR_PIN flow unchanged.)
   bool needsSetup = !vaultCryptoProvisioned();
   if (needsSetup) { extern void setupPinInit(); setupPinInit(); }
-  navStack[0] = needsSetup ? SCR_SETUP_PIN : SCR_LOCK;
+  navStack[0] = needsSetup ? SCR_SETUP_PIN : SCR_MEDIA;
   current     = navStack[0];
 
   // Keep the logo a beat (it's been up during init), play the booting dots,
@@ -952,8 +983,14 @@ void screenSleep() {
   vaultLock();
   passwordCount = 0;
   ckSecureZero(pinEntry, sizeof(pinEntry));
-  navTop = 0; navStack[0] = SCR_LOCK; current = SCR_LOCK; pinLen = 0;
+  navTop = 0; navStack[0] = SCR_MEDIA; current = SCR_MEDIA; pinLen = 0;
   drawAll();
+  // NOTE: screenSleep() drops BLE entirely (hidBleEnd()) to save battery
+  // while the panel is dark — that's an existing, deliberate choice and
+  // applies here unchanged. It means media keys are not sendable over BLE
+  // while the screen is off, same as password typing; USB media keys are
+  // unaffected (USB stays enumerated). The screen wakes back into
+  // SCR_MEDIA (set above) per the side-button handler in loop().
   if (settings.bleEnabled && hidBleCompiled()) {
     hidBleEnd(); bleAuthorized = false; btConnected = false;
   }
@@ -1148,7 +1185,10 @@ void loop() {
     // occasionally flashes the request before its identity resolves.
     bool identified = connPeerCaptured &&
                       (connPeerBonded || (millis() - connRisingAt > 8000));
-    bool unlocked = (current != SCR_LOCK && current != SCR_PIN);
+    // SCR_MEDIA is the vault's resting/locked screen (see popToLock()) — the
+    // BLE typing-Accept gate must stay suppressed there too, same as
+    // SCR_LOCK/SCR_PIN, since the vault genuinely isn't unlocked yet.
+    bool unlocked = (current != SCR_LOCK && current != SCR_PIN && current != SCR_MEDIA);
     if (stable && identified && !bleAuthorized && unlocked && !screenOff &&
         millis() >= bleGateSnooze) {
       // If this is the specifically blocked MAC and the block window hasn't
@@ -1173,16 +1213,18 @@ void loop() {
     drawWifi();
   }
 
-  // Auto-lock after idle (security). Skipped on lock/PIN, and on the
+  // Auto-lock after idle (security). Skipped on lock/PIN/media, and on the
   // flashlight + WiFi-import (no vault list shown, and they shouldn't be
   // interrupted while in use).
-  // NOTE: this only collapses to the LOCK screen — the display stays ON and
-  // touch stays live. It used to lightSleep() here, which darkened the panel
-  // and gated wake on a double-tap: in QA that read as "touch randomly stops
-  // working during idle" (Bug 3). BLE also stays up, so an idle lock no
+  // NOTE: this only collapses to the resting screen — the display stays ON
+  // and touch stays live. It used to lightSleep() here, which darkened the
+  // panel and gated wake on a double-tap: in QA that read as "touch randomly
+  // stops working during idle" (Bug 3). BLE also stays up, so an idle lock no
   // longer kills an accepted connection.
+  // SCR_MEDIA is excluded because it's already the locked/resting screen —
+  // popToLock() would just redraw the same screen it's already on.
   if (settings.autoLockSec > 0 && !screenOff &&
-      current != SCR_LOCK && current != SCR_PIN &&
+      current != SCR_LOCK && current != SCR_PIN && current != SCR_MEDIA &&
       current != SCR_FLASH && current != SCR_WIFI &&
       (millis() - lastActivityMs) > (uint32_t)settings.autoLockSec * 1000UL) {
     popToLock();

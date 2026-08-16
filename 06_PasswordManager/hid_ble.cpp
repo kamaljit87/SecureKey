@@ -98,6 +98,21 @@
     kb.release(k);
     delay(BLE_GAP_MS);
   }
+
+  // Same press/hold/release discipline, but for the Consumer Control (media
+  // key) report instead of the keyboard report. BleKeyboard's asciimap/
+  // KeyReport machinery is untouched by this — press(MediaKeyReport)/
+  // release() below hit the library's separate inputMediaKeys HID
+  // characteristic. Deliberately independent of bleAuthorized/vaultUnlocked
+  // — see the file-header note: media keys must work while the vault is
+  // locked, exactly like a normal Bluetooth media remote.
+  static void bleMediaKey(const MediaKeyReport &k) {
+    if (!kb.isConnected()) return;
+    kb.press(k);
+    delay(BLE_HOLD_MS);
+    kb.release(k);
+    delay(BLE_GAP_MS);
+  }
 #endif
 
 extern "C" {
@@ -431,6 +446,49 @@ void hidBleReturn() {
 #if HID_BLE_ENABLE
   if (!active || !kb.isConnected()) return;
   bleRawKey(KEY_RETURN);
+#endif
+}
+
+// ── Consumer Control (media key) support ────────────────────────────────
+// Deliberately INDEPENDENT of bleAuthorized/vaultUnlocked — see the
+// file-header note above. A media remote works whether or not the vault is
+// unlocked, exactly like it would while your phone is locked. `code` is one
+// of the MEDIA_KEY_* selectors below (media_control.ino owns the mapping to
+// keep this file's public surface tiny and library-agnostic).
+enum {
+  MEDIA_KEY_VOLUME_UP = 0,
+  MEDIA_KEY_VOLUME_DOWN,
+  MEDIA_KEY_MUTE,
+  MEDIA_KEY_PLAY_PAUSE,
+  MEDIA_KEY_PREV_TRACK,
+  MEDIA_KEY_NEXT_TRACK,
+};
+
+void hidBleMediaKey(int code) {
+#if HID_BLE_ENABLE
+  if (!active || !kb.isConnected()) return;
+  switch (code) {
+    case MEDIA_KEY_VOLUME_UP:   bleMediaKey(KEY_MEDIA_VOLUME_UP);      break;
+    case MEDIA_KEY_VOLUME_DOWN: bleMediaKey(KEY_MEDIA_VOLUME_DOWN);    break;
+    case MEDIA_KEY_MUTE:        bleMediaKey(KEY_MEDIA_MUTE);           break;
+    case MEDIA_KEY_PLAY_PAUSE:  bleMediaKey(KEY_MEDIA_PLAY_PAUSE);     break;
+    case MEDIA_KEY_PREV_TRACK:  bleMediaKey(KEY_MEDIA_PREVIOUS_TRACK); break;
+    case MEDIA_KEY_NEXT_TRACK:  bleMediaKey(KEY_MEDIA_NEXT_TRACK);     break;
+    default: break;
+  }
+#else
+  (void)code;
+#endif
+}
+
+// Is a BLE HID host currently connected? (media_control.ino uses this to
+// decide whether to attempt a BLE media key send — independent of
+// bleAuthorized, unlike hidBleConnected()'s typing-path callers.)
+int hidBleMediaReady() {
+#if HID_BLE_ENABLE
+  return (everStarted && active && kb.isConnected()) ? 1 : 0;
+#else
+  return 0;
 #endif
 }
 
