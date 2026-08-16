@@ -206,7 +206,6 @@ jobs:
       # Copy firmware to firmware directory
       # --------------------------------------------------------
       - name: Copy firmware to firmware directory
-        if: github.event_name == 'push'
         run: |
           mkdir -p firmware
 
@@ -230,7 +229,6 @@ jobs:
       # Commit updated firmware
       # --------------------------------------------------------
       - name: Commit updated firmware
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
