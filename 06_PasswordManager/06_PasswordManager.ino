@@ -80,6 +80,12 @@ extern "C" {
 #include <Adafruit_NeoPixel.h>
 #include <FFat.h>
 #include <Preferences.h>
+#include <WiFi.h>           // WiFiEvent_t/WiFiEventInfo_t — wifi_portal.ino's
+                            // diagnostic event callback takes these by value;
+                            // needs to be visible before Arduino's hoisted
+                            // prototypes, same reasoning as bw_json_parser.h
+                            // below (wifi_portal.ino itself also includes
+                            // <WiFi.h>, but that's too late for hoisting).
 #include "pin_config.h"
 #include "theme.h"
 #include "esp_system.h"     // esp_reset_reason() — logged at boot

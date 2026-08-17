@@ -61,6 +61,49 @@ static int        portalImported = 0;     // running count (for the screen)
 static bool       portalNeedReload = false;
 static bool       portalImportMode = false;   // false = general manager, true = Bitwarden import
 
+// ── Diagnostic WiFi event logging ─────────────────────────────────────
+// Registered ONCE (idempotent — see wifiPortalStartCommon()) so a station
+// (phone/laptop) actually reaching the radio at all — even if the join
+// then fails — is visible on serial. This is what lets "stuck on the WiFi
+// wait screen" be distinguished between: (a) the AP never came up, (b) a
+// station never even attempts to associate (radio/RF issue), (c) a station
+// associates then is kicked (auth/handshake issue), (d) association
+// succeeds but the browser/DNS/HTTP layer above never gets exercised.
+// Only counts/reason codes are logged — no SSID/password/MAC-adjacent
+// secrets beyond what's already inherent to "a station connected".
+static bool s_wifiEventHandlerRegistered = false;
+static void wifiPortalOnEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_AP_START:
+      SK_LOGLN("[WIFI] event: AP_START (radio up, advertising)");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STOP:
+      SK_LOGLN("[WIFI] event: AP_STOP");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
+      // A nearby device is scanning/asking about us — proves the radio link
+      // is physically working even before any join attempt.
+      SK_LOGLN("[WIFI] event: AP_PROBEREQRECVED (a device is scanning nearby)");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      SK_LOGLN("[WIFI] event: AP_STACONNECTED (a station associated)");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      // NOTE: this IDF version's wifi_event_ap_stadisconnected_t has no
+      // `reason` field (added in a later IDF release) — just the fact of
+      // disconnection is still useful: "associated then immediately
+      // disconnected" points at an auth/handshake problem even without a
+      // numeric reason code.
+      SK_LOGLN("[WIFI] event: AP_STADISCONNECTED (a station left/was dropped)");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+      SK_LOGLN("[WIFI] event: AP_STAIPASSIGNED (station got a DHCP lease)");
+      break;
+    default:
+      break;
+  }
+}
+
 // Hard cap on how long the portal can stay up in one session REGARDLESS of
 // request activity — bounds "device left unattended with the import screen
 // open and someone keeps poking it" to a fixed window, on top of the
@@ -450,6 +493,17 @@ static bool wifiPortalStartCommon() {
     delay(60);
   }
 
+  // Diagnostic event log — registered once, never removed (harmless no-op
+  // logging for the life of the sketch). Lets a failed join be diagnosed
+  // from serial: AP never starting, a station never reaching the radio at
+  // all (RF/power issue), a station associating then being kicked
+  // (auth/handshake issue, logged with its reason code), or association
+  // succeeding but nothing above that layer working.
+  if (!s_wifiEventHandlerRegistered) {
+    WiFi.onEvent(wifiPortalOnEvent);
+    s_wifiEventHandlerRegistered = true;
+  }
+
   WiFi.mode(WIFI_AP);
   // channel 1, not hidden, up to 2 clients. This used to be capped at 1 —
   // that starved the join itself on phones (esp. iOS) that open a silent
@@ -461,11 +515,29 @@ static bool wifiPortalStartCommon() {
   // boundary is unchanged: every state-changing route still requires the
   // single per-session 6-digit code, so a second raw association slot does
   // not let a second party do anything.
-  WiFi.softAP(portalSsid, portalPass, 1, 0, 2);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);            // cut the current spike
+  bool apOk = WiFi.softAP(portalSsid, portalPass, 1, 0, 2);
+  if (!apOk) {
+    // Fail LOUDLY instead of marching on with portalActive=true over a
+    // radio that never actually came up — this alone could produce exactly
+    // "SSID/password/code shown on-device, but nothing ever joins",
+    // because the screen doesn't know the softAP() call itself failed.
+    SK_LOGLN("[WIFI] softAP() FAILED — AP did not start");
+    WiFi.mode(WIFI_OFF);
+    if (portalBleWasOn && settings.bleEnabled && hidBleCompiled()) hidBleBegin();
+    portalBleWasOn = false;
+    return false;
+  }
+  // TX power: was WIFI_POWER_8_5dBm (~7 mW) — genuinely weak, and on some
+  // hardware/enclosures that's marginal even at point-blank range, not just
+  // "cutting a current spike". WIFI_POWER_13dBm (~20 mW) keeps meaningful
+  // headroom below the old full-power default (WIFI_POWER_19_5dBm, the
+  // documented brownout trigger) while giving the radio enough margin to
+  // actually complete a WPA2 handshake reliably.
+  WiFi.setTxPower(WIFI_POWER_13dBm);
   delay(100);
-  SK_LOG("[WIFI] post-start heap: free=%u minfree=%u\n",
-         ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  SK_LOG("[WIFI] post-start heap: free=%u minfree=%u  apIP=%s  txPower=%d\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+         WiFi.softAPIP().toString().c_str(), (int)WiFi.getTxPower());
   portalDns.start(53, "*", WiFi.softAPIP());     // all domains → us
   return true;
 }
