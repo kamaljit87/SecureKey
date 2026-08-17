@@ -1155,8 +1155,30 @@ void loop() {
   // reboot), refresh the status icon, and surface the Accept/Reject/Block
   // prompt on a new connection — but only once the device is unlocked, so the
   // request appears *after* the PIN is entered.
+  //
+  // MUST stay fully suppressed while the WiFi import portal is active —
+  // wifiPortalStartCommon() (wifi_portal.ino) deliberately calls hidBleEnd()
+  // before bringing up the SoftAP specifically because WiFi + BLE share ONE
+  // 2.4 GHz radio, and running both at once is a documented reset trigger on
+  // this hardware (see that function's "Restart-bug mitigation" comment).
+  // Without this guard, THIS block would see hidBleStarted()==false a
+  // moment later (since the WiFi code just turned it off) and — if the user
+  // has Bluetooth enabled in Settings, which is a completely ordinary
+  // setting — call hidBleBegin() right back on its own next ~2 Hz tick,
+  // fighting the WiFi code's radio-safety decision on every single loop()
+  // pass for as long as the portal stayed up. That is a REAL, confirmed bug
+  // (not a guess): a physical serial capture during a Bitwarden import
+  // showed exactly "[WIFI] stopping BLE before AP" followed moments later
+  // by "[BLE] resume advertising" — this block re-enabling it — followed by
+  // a PANIC reset during the upload, with the exact byte offset varying
+  // run-to-run (consistent with a timing-dependent race against this ~2 Hz
+  // tick, not a fixed line in the upload/parse code). wifiPortalStop()
+  // already explicitly restores BLE once the portal actually ends (its own
+  // "resuming BLE after AP" log line) — that single restore point is
+  // correct and sufficient; this block must not compete with it while a
+  // portal session is live.
   static uint32_t lastBleMs = 0;
-  if (millis() - lastBleMs > 500) {
+  if (millis() - lastBleMs > 500 && !wifiPortalActive()) {
     lastBleMs = millis();
 
     if (hidBleCompiled()) {
