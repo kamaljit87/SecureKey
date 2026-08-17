@@ -233,10 +233,30 @@ void onTapPin(int16_t tx, int16_t ty) {
     if (strcmp(k, "BS") == 0) {
       if (pinLen) { pinEntry[--pinLen] = 0; }
     } else if (strcmp(k, "OK") == 0) {
-      if (pinLen >= PIN_MIN_LEN) pinTryUnlock();
+      // pinTryUnlock() -> pinUnlockSuccess() already fully redraws the
+      // destination screen (SCR_HOME or SCR_MIGRATE_V3) and fades it in.
+      // Falling through to drawPin() below used to immediately stomp that
+      // redraw with a fresh empty keypad — the vault WAS unlocked
+      // (current was genuinely SCR_HOME internally), but the screen kept
+      // showing an empty PIN pad, which looked exactly like the unlock
+      // had silently failed/reset every single time. Only redraw the
+      // keypad here on a WRONG PIN, where we're deliberately staying on
+      // SCR_PIN to show the shake/lockout state.
+      if (pinLen >= PIN_MIN_LEN) {
+        pinTryUnlock();
+        if (current != SCR_PIN) return;
+      }
     } else if (pinLen < pinDisplayLen()) {
       pinEntry[pinLen++] = k[0];
-      if (pinLen == pinDisplayLen()) { pinTryUnlock(); drawPin(); return; }
+      if (pinLen == pinDisplayLen()) {
+        // Same reasoning as the OK-key branch above: only redraw the
+        // keypad ourselves if the unlock attempt left us still on SCR_PIN
+        // (i.e. it failed) — a success already drew its own destination
+        // screen and must not be overwritten here.
+        pinTryUnlock();
+        if (current == SCR_PIN) drawPin();
+        return;
+      }
     }
     drawPin();
     return;
