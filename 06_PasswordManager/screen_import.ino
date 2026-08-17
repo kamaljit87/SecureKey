@@ -72,7 +72,15 @@ static bool importWarnPending = false;
 
 void importWarnShow() {
   importWarnPending = true;
-  drawAll();
+  // Must actually NAVIGATE to SCR_IMPORT_WAIT here, not just call drawAll()
+  // — the only place that checks importWarnPending is drawImportWait()/
+  // onTapImportWait() (the warning is drawn as a pre-AP sub-state of the
+  // wait screen). Calling drawAll() while `current` was still
+  // SCR_IMPORT_SOURCE just redrew the source-select list unchanged, which
+  // looked exactly like the "Bitwarden Import" row silently doing nothing
+  // on tap — pushNav() is what actually gets us onto SCR_IMPORT_WAIT so its
+  // importWarnPending check is reachable at all.
+  pushNav(SCR_IMPORT_WAIT);
 }
 
 static void drawImportWarn() {
@@ -107,14 +115,28 @@ static void onTapImportWarn(int16_t tx, int16_t ty) {
   const int16_t by1 = by2 - bh - gap;
 
   if (tx >= bx && tx < bx + bw && ty >= by1 && ty < by1 + bh) {
+    // We're already ON SCR_IMPORT_WAIT here — importWarnShow() (above)
+    // pushed it before drawing this warning as a pre-AP sub-state of that
+    // same screen. Do NOT pushNav(SCR_IMPORT_WAIT) again (that would double
+    // it on the nav stack, and CANCEL's popNav() on the next screen would
+    // land back on a stale warning-flagged SCR_IMPORT_WAIT instead of
+    // SCR_IMPORT_SOURCE). Just clear the flag, start the portal, and
+    // redraw — the next drawAll() falls through to the normal
+    // drawImportWait() body since importWarnPending is now false.
     importWarnPending = false;
     wifiPortalStartImportMode();
-    pushNav(SCR_IMPORT_WAIT);
+    drawAll();
     return;
   }
   if (tx >= bx && tx < bx + bw && ty >= by2 && ty < by2 + bh) {
+    // CANCEL: back OUT of the SCR_IMPORT_WAIT that importWarnShow() pushed
+    // us onto — popNav() returns to SCR_IMPORT_SOURCE, matching what this
+    // button looked like it did before the warning screen had its own nav
+    // entry (a bare drawAll() here would instead redraw the NORMAL
+    // drawImportWait() body against a portal that was never started, i.e.
+    // "Starting WiFi..." forever — a dead end, not a cancel).
     importWarnPending = false;
-    drawAll();
+    popNav();
     return;
   }
 }
