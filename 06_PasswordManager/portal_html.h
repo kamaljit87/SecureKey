@@ -174,6 +174,18 @@ $("gcode").addEventListener("keydown",function(e){if(e.key=="Enter")unlock()});
 //  — nothing here changes that; this page just needs to SEND it as a real
 //  file, not a form field, for that streaming to be possible at all.
 // =============================================================
+// Two sequential views in one page — #gate (code entry) shown first, #app
+// (the actual upload form) hidden until a real server-side check confirms
+// the code, mirroring PORTAL_HTML's existing #gate/#app overlay-swap idiom
+// above (that page's unlock()/load() pair does the same thing via its
+// /list route; this page uses a dedicated, side-effect-free
+// /import/bitwarden/verify endpoint instead, since /list doesn't exist in
+// restricted import mode). The upload form/file-picker is not merely
+// visually hidden as a UI nicety — the SERVER independently re-checks the
+// same code on every request to /import/bitwarden/upload regardless of
+// what this page shows, so there is no client-side-only trust boundary
+// here; this gating is what makes the UI correctly REFLECT that boundary
+// instead of misleadingly showing a form the server would reject anyway.
 static const char PORTAL_IMPORT_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>SecureKey — Bitwarden Import</title><style>
@@ -201,32 +213,69 @@ label{display:block;font-size:12px;color:var(--mut);margin:12px 2px 6px;font-wei
   <h1>SecureKey</h1><p class="mut">Bitwarden Import</p>
  </div>
 
- <div class="warn">This export contains your passwords in plaintext. Only import it over a trusted connection. SecureKey will encrypt the vault after import.</div>
-
- <div class="card">
+ <div id="gateView" class="card">
   <label>Device code</label>
   <input id="code" class="gate" inputmode="numeric" maxlength="6" placeholder="------">
+  <div style="margin-top:14px"><button id="goCode" onclick="doVerify()">Continue</button></div>
+  <div class="status" id="gateStatus"></div>
+ </div>
 
-  <div class="filepick">
-   <input type="file" id="file" accept=".json,application/json">
-   <p class="mut" style="margin-top:8px">Select your Bitwarden JSON export (unencrypted)</p>
+ <div id="uploadView" class="hidden">
+  <div class="warn">This export contains your passwords in plaintext. Only import it over a trusted connection. SecureKey will encrypt the vault after import.</div>
+
+  <div class="card">
+   <div class="filepick">
+    <input type="file" id="file" accept=".json,application/json">
+    <p class="mut" style="margin-top:8px">Select your Bitwarden JSON export (unencrypted)</p>
+   </div>
+
+   <div style="margin-top:14px"><button id="go" onclick="doUpload()">Upload</button></div>
+   <div class="bar hidden" id="barWrap"><div class="fill" id="fill"></div></div>
+   <div class="status" id="status"></div>
   </div>
-
-  <div style="margin-top:14px"><button id="go" onclick="doUpload()">Upload</button></div>
-  <div class="bar hidden" id="barWrap"><div class="fill" id="fill"></div></div>
-  <div class="status" id="status"></div>
  </div>
 
  <p class="mut" style="text-align:center">Nothing leaves this WiFi. The device encrypts everything after import.</p>
 </div>
 <script>
 function $(i){return document.getElementById(i)}
+var CODE="";
+
+function setGateStatus(s,isErr){$("gateStatus").textContent=s;$("gateStatus").style.color=isErr?"#ff5f6d":"#8a93a4"}
 function setStatus(s,isErr){$("status").textContent=s;$("status").style.color=isErr?"#ff5f6d":"#8a93a4"}
 
-function doUpload(){
+// Step 1: verify the device code against a side-effect-free server check
+// BEFORE ever showing the upload form — this is what actually gates the
+// UI (see the comment above the raw string this page lives in).
+function doVerify(){
   var code=$("code").value.trim();
+  if(!code||code.length!=6){setGateStatus("Enter the 6-digit code shown on your device.",true);return}
+  $("goCode").disabled=true;
+  setGateStatus("Checking...");
+  fetch("/import/bitwarden/verify?code="+encodeURIComponent(code)).then(function(r){
+    $("goCode").disabled=false;
+    if(r.status==200){
+      CODE=code;
+      $("gateView").classList.add("hidden");
+      $("uploadView").classList.remove("hidden");
+    } else if(r.status==401){
+      setGateStatus("Invalid code.",true);
+    } else {
+      setGateStatus("Device not ready (HTTP "+r.status+"). Try again.",true);
+    }
+  }).catch(function(){
+    $("goCode").disabled=false;
+    setGateStatus("Connection error — check you're still on the SecureKey WiFi.",true);
+  });
+}
+$("code").addEventListener("keydown",function(e){if(e.key=="Enter")doVerify()});
+
+// Step 2: the actual upload — only reachable once doVerify() succeeded and
+// revealed #uploadView. The server independently re-checks CODE on this
+// request too (see this file's header comment) — this page never trusts
+// its own hidden/shown state as the real security boundary.
+function doUpload(){
   var f=$("file").files[0];
-  if(!code||code.length!=6){setStatus("Enter the 6-digit code shown on your device.",true);return}
   if(!f){setStatus("Choose a file first.",true);return}
 
   $("go").disabled=true;
@@ -237,7 +286,7 @@ function doUpload(){
   fd.append("file",f);
 
   var xhr=new XMLHttpRequest();
-  xhr.open("POST","/import/bitwarden/upload?code="+encodeURIComponent(code));
+  xhr.open("POST","/import/bitwarden/upload?code="+encodeURIComponent(CODE));
   xhr.upload.onprogress=function(e){
     if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);$("fill").style.width=pct+"%";setStatus("Uploading... "+pct+"%")}
   };
@@ -246,6 +295,8 @@ function doUpload(){
     if(xhr.status==200){
       setStatus("Upload complete. Continue on your SecureKey device.");
       $("fill").style.width="100%";
+    } else if(xhr.status==401){
+      setStatus("Session expired — the device code changed or is no longer valid. Reload this page.",true);
     } else {
       setStatus("Upload failed: "+(xhr.responseText||("HTTP "+xhr.status)),true);
     }

@@ -370,9 +370,42 @@ static bool portalImportCodeOk() {
 // into the Bitwarden JSON parser (bw_import.ino) with no intermediate
 // copy — the raw upload buffer is owned/reused by the WebServer library
 // between calls, so there is nothing here for THIS code to separately wipe.
-static bool s_importUploadOk = false;   // set false on any failure; UPLOAD_FILE_WRITE
-                                        // keeps draining bytes either way so the
-                                        // connection doesn't hang, but stops staging.
+static bool     s_importUploadOk = false;   // set false on any failure; UPLOAD_FILE_WRITE
+                                            // keeps draining bytes either way so the
+                                            // connection doesn't hang, but stops staging.
+static uint32_t s_importChunkCount = 0;     // diagnostic only — reset per upload
+
+// ── Watchdog note — READ THIS BEFORE TOUCHING THE delay(1) BELOW ─────────
+// WebServer::_parseForm() (Parsing.cpp, this project's pinned ESP32 core
+// 2.0.16) copies the ENTIRE multipart body one byte at a time inside a
+// SINGLE synchronous call, calling back into portalImportUploadChunk() only
+// once per HTTP_UPLOAD_BUFLEN (1436-byte) chunk. That whole per-request copy
+// loop runs inside one call to WebServer::handleClient() (wifiPortalLoop()),
+// with no yield anywhere in the library's own loop except a delay(2) that
+// only fires when the socket has momentarily no data — i.e. NOT during a
+// normal, actively-flowing transfer.
+//
+// This project's sdkconfig has CONFIG_ESP_TASK_WDT_TIMEOUT_S=5 and
+// CONFIG_ESP_TASK_WDT_PANIC=y: the FreeRTOS idle task must run within 5s or
+// the Task Watchdog panics (reboots) — and per ESP-IDF's scheduler, only an
+// actual delay()/vTaskDelay() call (not taskYIELD()) blocks the current task
+// long enough for the idle task to run and feed that watchdog. Confirmed via
+// direct source read of Parsing.cpp plus ESP-IDF/arduino-esp32 documentation.
+//
+// Net effect (this was the confirmed cause of "device reboots when a file is
+// uploaded" — not heap/stack corruption, not the JSON parser, which is
+// already correctly bounded/streaming): ANY upload whose total transfer time
+// exceeds ~5s wall-clock (slow/bursty WiFi, or per-chunk processing cost
+// inside bwImportFeed() below) starves the idle task for the WHOLE upload
+// and panics. The fix is a delay(1) called HERE, on every WRITE chunk — the
+// library invokes this callback every ~1436 bytes, i.e. many times over the
+// course of one upload, so a yield placed at this exact point fires
+// regularly throughout the transfer. This mirrors the same "yield
+// periodically inside a long blocking operation" idiom already used
+// elsewhere in this codebase (bwImportCommit() in bw_import.ino,
+// screen_migrate.ino) — not a new pattern, and not a blind "add a delay
+// somewhere and hope" — it targets the exact call site that was starving
+// the watchdog.
 static void portalImportUploadChunk() {
   HTTPUpload &upload = portalSrv.upload();
   portalLastSeen = millis();   // bump on EVERY chunk — a slow-but-active upload
@@ -381,24 +414,44 @@ static void portalImportUploadChunk() {
   switch (upload.status) {
     case UPLOAD_FILE_START:
       s_importUploadOk = portalImportCodeOk();
+      s_importChunkCount = 0;
       if (!s_importUploadOk) {
         SK_LOGLN("[BWIMPORT] upload rejected: bad code or vault locked");
         return;
       }
       // bwImportBegin() already ran when the portal entered import mode
       // (wifiPortalStartImportMode()) — nothing further to initialize here.
+      // Counts/sizes/memory only — never filename/content.
+      SK_LOG("[BWIMPORT] upload started  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+             ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
       break;
 
     case UPLOAD_FILE_WRITE:
-      if (!s_importUploadOk) return;   // draining bytes, not staging them
+      if (!s_importUploadOk) { delay(1); return; }   // still yield while draining
       if (!bwImportFeed(upload.buf, upload.currentSize)) {
         s_importUploadOk = false;      // parser errored — stop staging, keep draining
       }
+      s_importChunkCount++;
+      // Snapshot memory every ~32 chunks (~45 KB) rather than every chunk —
+      // enough resolution to see a real leak/exhaustion trend during a large
+      // upload without flooding serial on every 1436-byte packet.
+      if ((s_importChunkCount % 32) == 0) {
+        SK_LOG("[BWIMPORT] chunk %u  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+               s_importChunkCount, ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
+      }
+      // THE ACTUAL FIX for the reboot-on-upload bug — see the file comment
+      // above this function for the full mechanism. Must run on every
+      // chunk, unconditionally, success or parser-error alike (a slow
+      // upload that's already failed parsing still needs to keep draining
+      // bytes off the socket without starving the watchdog).
+      delay(1);
       break;
 
     case UPLOAD_FILE_END:
       // Finalization happens in portalImportUploadDone() (the `fn` callback,
       // called once after the whole request completes) — nothing to do here.
+      SK_LOG("[BWIMPORT] upload received: %u chunks, %u bytes total\n",
+             s_importChunkCount, (unsigned)upload.totalSize);
       break;
 
     case UPLOAD_FILE_ABORTED:
@@ -409,12 +462,41 @@ static void portalImportUploadChunk() {
   }
 }
 
+// GET /import/bitwarden/verify?code=XXX — side-effect-free auth check the
+// upload page calls BEFORE ever revealing the file-picker/upload UI. Reuses
+// the SAME 6-digit portalCode gate every other route already enforces (no
+// new auth mechanism, no session token, no cookie — see this file's header
+// comment on the security model). Returns 200 with no body on a correct
+// code, 401 otherwise, so the page can gate its own UI state accordingly
+// (see PORTAL_IMPORT_HTML in portal_html.h) — the server-side routes below
+// (upload/cancel) independently re-check the same code on every request
+// regardless of what this endpoint said, so a client can never bypass
+// authentication by skipping this call.
+static void portalImportVerifyCode() {
+  portalLastSeen = millis();
+  if (!portalImportCodeOk()) {
+    // 401 specifically for "wrong/missing code" — distinct from 403, which
+    // is reserved for "the vault is locked out from under an otherwise-
+    // valid session" (see below). Lets the page show the right message.
+    portalSrv.send(401, "text/plain", "invalid code");
+    return;
+  }
+  portalSrv.send(200, "text/plain", "ok");
+}
+
 // Called once after the full multipart request completes (success or the
 // client disconnected — WebServer still invokes this). Sends the actual
 // HTTP response.
 static void portalImportUploadDone() {
+  if (!vaultUnlocked || !portalImportMode) {
+    // The SESSION itself is no longer valid (vault locked / portal left
+    // import mode) — distinct from "code was simply wrong", which a retry
+    // can fix; this can't be fixed by re-entering the code.
+    portalSrv.send(403, "text/plain", "session no longer valid");
+    return;
+  }
   if (!portalImportCodeOk()) {
-    portalSrv.send(403, "text/plain", "bad code or vault locked");
+    portalSrv.send(401, "text/plain", "invalid code");
     return;
   }
   if (!s_importUploadOk) {
@@ -438,7 +520,7 @@ static void portalImportUploadDone() {
 // CANCEL button on SCR_IMPORT_WAIT/SCR_IMPORT_PREVIEW calls bwImportDiscard()
 // directly without going through HTTP).
 static void portalImportCancel() {
-  if (!portalImportCodeOk()) { portalSrv.send(403, "text/plain", "bad code"); return; }
+  if (!portalImportCodeOk()) { portalSrv.send(401, "text/plain", "invalid code"); return; }
   bwImportDiscard();
   SK_LOGLN("[BWIMPORT] import cancelled by user (web)");
   portalSrv.send(200, "text/plain", "ok");
@@ -576,6 +658,7 @@ void wifiPortalStartImportMode() {
   bwImportBegin();   // resets BwImportCtx, opens the staging files
 
   portalSrv.on("/", HTTP_GET, portalSendImportHtml);
+  portalSrv.on("/import/bitwarden/verify", HTTP_GET, portalImportVerifyCode);
   portalSrv.on("/import/bitwarden/upload", HTTP_POST,
               portalImportUploadDone, portalImportUploadChunk);
   portalSrv.on("/import/bitwarden/cancel", HTTP_POST, portalImportCancel);

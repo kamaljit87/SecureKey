@@ -325,6 +325,8 @@ bool bwImportEnd() {
   SK_LOG("[BWIMPORT] parsed: %u logins, %u notes, %u folders, %u unsupported, %u duplicates\n",
          bwImportCtx.loginsFound, bwImportCtx.notesFound, bwImportCtx.foldersFound,
          bwImportCtx.unsupportedFound, bwImportCtx.duplicatesFound);
+  SK_LOG("[BWIMPORT] post-parse memory: freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
   bwImportCtx.stage = BW_STAGE_AWAITING_PREVIEW;
   return true;
 }
@@ -354,7 +356,8 @@ bool bwImportCommit() {
   if (bwImportCtx.stage != BW_STAGE_AWAITING_PREVIEW) return false;
   if (!vaultUnlocked) { bwSetError("Vault locked"); return false; }
   bwImportCtx.stage = BW_STAGE_IMPORTING;
-  SK_LOGLN("[BWIMPORT] commit started");
+  SK_LOG("[BWIMPORT] commit started  freeHeap=%u minFreeHeap=%u freePsram=%u  staged=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram(), bwImportCtx.stagedCount);
 
   // ── Step A1: resolve every staged Bitwarden folder id -> a real
   // SecureKey folder id (creating folders as needed), building a small
@@ -536,6 +539,8 @@ bool bwImportCommit() {
   FFat.remove(BW_STAGING_PATH);
   FFat.remove(BW_FOLDERS_STAGING_PATH);
   SK_LOGLN("[BWIMPORT] commit complete — staging files removed");
+  SK_LOG("[BWIMPORT] post-commit memory: freeHeap=%u minFreeHeap=%u freePsram=%u  added=%u total=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram(), added, totalCount);
 
   foldersLoadIndex();
   dbLoadIndex();
