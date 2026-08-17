@@ -158,11 +158,15 @@ static void spFinishProvision() {
     return;
   }
 
-  // Brand-new vault: no old data to migrate. dbSeed() creates the empty
-  // encrypted database and, ONLY on a SECUREKEY_DEMO_MODE build (see
-  // storage.ino), also seeds a few obviously-fake example.invalid demo
-  // entries — production builds never compile in demo credentials, so
-  // this call is always safe to leave in place.
+  // Brand-new vault: no old data to migrate. foldersCreateEmpty() sets up an
+  // empty folder table (fresh vault -> DB_FORMAT_VERSION 3 directly, so
+  // folder IDs are meaningful from the start, no migration ever needed).
+  // dbSeed() creates the empty encrypted database and, ONLY on a
+  // SECUREKEY_DEMO_MODE build (see storage.ino), also seeds a few
+  // obviously-fake example.invalid demo entries — production builds never
+  // compile in demo credentials, so this call is always safe to leave in place.
+  foldersCreateEmpty();
+  foldersLoadIndex();
   dbSeed();
   dbLoadIndex();
   gfx->fillScreen(C_BLACK); drawStatusBar();

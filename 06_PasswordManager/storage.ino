@@ -163,11 +163,28 @@ void dbLoadIndex() {
     ListItem &li = passwordIndex[passwordCount++];
     li.id = pr.id;
     li.favorite = pr.favorite;
-    strncpy(li.folder, pr.folder, sizeof(li.folder) - 1);
-    li.folder[sizeof(li.folder) - 1] = 0;
+    // pr.folder holds a folder-ID decimal string (DB_FORMAT_VERSION 3+ — see
+    // folders.ino / shared_types.h) — resolve it to the actual folder NAME
+    // here so screen_list.ino's existing rendering/search keep working
+    // completely unchanged, just now showing a real name instead of an id.
+    {
+      uint16_t fid = (uint16_t)atoi(pr.folder);
+      char fname[PT_FOLDER_NAME_LEN];
+      folderNameForId(fid, fname, sizeof(fname));
+      strncpy(li.folder, fname, sizeof(li.folder) - 1);
+      li.folder[sizeof(li.folder) - 1] = 0;
+      ckSecureZero(fname, sizeof(fname));
+    }
     strncpy(li.title, pr.title, sizeof(li.title) - 1);
     li.title[sizeof(li.title) - 1] = 0;
     ckSecureZero(&pr, sizeof(pr));   // title/folder already copied out above
+
+    // Refresh the lowercased search cache (screen_list.ino) for this slot —
+    // titles/folders are non-secret UI labels (see this file's header note),
+    // so caching a case-folded copy alongside the index is the same
+    // sensitivity class as passwordIndex itself. Keeps buildList() from
+    // re-lowercasing every entry on every search keystroke.
+    listCacheFold(passwordCount - 1);
   }
   f.close();
 }

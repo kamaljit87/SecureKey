@@ -158,3 +158,99 @@ function doImport(){post("/save",{bulk:$("ibulk").value}).then(function(){closeI
 function doExport(){window.location="/export?code="+encodeURIComponent(CODE)}
 $("gcode").addEventListener("keydown",function(e){if(e.key=="Enter")unlock()});
 </script></body></html>)HTML";
+
+// =============================================================
+//  PORTAL_IMPORT_HTML  —  Bitwarden import upload page
+//
+//  A SEPARATE, minimal page — NOT the general vault-manager PORTAL_HTML
+//  above. Deliberately has no vault-browsing UI (no list/search/export) to
+//  match the restricted route set wifiPortalStartImportMode() registers
+//  (wifi_portal.ino) — least privilege for an import session.
+//
+//  Real multipart file upload via <input type=file> + XMLHttpRequest (used
+//  instead of fetch() specifically for its native upload.onprogress event,
+//  so the page can show upload progress for a large export). The device
+//  streams/parses the file as it arrives (bw_json_parser.h/bw_import.ino)
+//  — nothing here changes that; this page just needs to SEND it as a real
+//  file, not a form field, for that streaming to be possible at all.
+// =============================================================
+static const char PORTAL_IMPORT_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SecureKey — Bitwarden Import</title><style>
+:root{--bg:#0b0e13;--card:#161b24;--card2:#1c222d;--line:#272e3a;--txt:#eef1f6;--mut:#8a93a4;--accent:#4d9fff;--ok:#36d67a;--err:#ff5f6d;--warn:#f4b740}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:radial-gradient(1000px 500px at 50% -10%,#15243b,#0b0e13) fixed;color:var(--txt);font-family:-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:520px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 4px}.mut{color:var(--mut);font-size:13px}
+input{width:100%;background:#0c0f15;color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:11px;font-size:15px;font-family:inherit;outline:none}
+input:focus{border-color:var(--accent)}
+button{border:0;border-radius:10px;padding:12px 14px;font-size:14px;font-weight:700;cursor:pointer;background:linear-gradient(140deg,#4d9fff,#2d77df);color:#04101f;width:100%}
+button:disabled{opacity:.5;cursor:default}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+.warn{background:#2a2312;border:1px solid #4a3d1a;color:var(--warn);border-radius:12px;padding:12px 14px;font-size:13px;margin-bottom:14px;line-height:1.5}
+label{display:block;font-size:12px;color:var(--mut);margin:12px 2px 6px;font-weight:600}
+.gate input{letter-spacing:8px;text-align:center;font-size:22px}
+.hidden{display:none}
+.bar{height:8px;background:#0c0f15;border:1px solid var(--line);border-radius:5px;overflow:hidden;margin-top:12px}
+.fill{height:100%;background:linear-gradient(90deg,#4d9fff,#2d77df);width:0%}
+.status{margin-top:10px;font-size:13px;color:var(--mut);text-align:center}
+.filepick{border:1px dashed var(--line);border-radius:10px;padding:18px;text-align:center;margin-top:10px}
+</style></head><body>
+<div class="wrap">
+ <div class="card">
+  <h1>SecureKey</h1><p class="mut">Bitwarden Import</p>
+ </div>
+
+ <div class="warn">This export contains your passwords in plaintext. Only import it over a trusted connection. SecureKey will encrypt the vault after import.</div>
+
+ <div class="card">
+  <label>Device code</label>
+  <input id="code" class="gate" inputmode="numeric" maxlength="6" placeholder="------">
+
+  <div class="filepick">
+   <input type="file" id="file" accept=".json,application/json">
+   <p class="mut" style="margin-top:8px">Select your Bitwarden JSON export (unencrypted)</p>
+  </div>
+
+  <div style="margin-top:14px"><button id="go" onclick="doUpload()">Upload</button></div>
+  <div class="bar hidden" id="barWrap"><div class="fill" id="fill"></div></div>
+  <div class="status" id="status"></div>
+ </div>
+
+ <p class="mut" style="text-align:center">Nothing leaves this WiFi. The device encrypts everything after import.</p>
+</div>
+<script>
+function $(i){return document.getElementById(i)}
+function setStatus(s,isErr){$("status").textContent=s;$("status").style.color=isErr?"#ff5f6d":"#8a93a4"}
+
+function doUpload(){
+  var code=$("code").value.trim();
+  var f=$("file").files[0];
+  if(!code||code.length!=6){setStatus("Enter the 6-digit code shown on your device.",true);return}
+  if(!f){setStatus("Choose a file first.",true);return}
+
+  $("go").disabled=true;
+  $("barWrap").classList.remove("hidden");
+  setStatus("Uploading...");
+
+  var fd=new FormData();
+  fd.append("file",f);
+
+  var xhr=new XMLHttpRequest();
+  xhr.open("POST","/import/bitwarden/upload?code="+encodeURIComponent(code));
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);$("fill").style.width=pct+"%";setStatus("Uploading... "+pct+"%")}
+  };
+  xhr.onload=function(){
+    $("go").disabled=false;
+    if(xhr.status==200){
+      setStatus("Upload complete. Continue on your SecureKey device.");
+      $("fill").style.width="100%";
+    } else {
+      setStatus("Upload failed: "+(xhr.responseText||("HTTP "+xhr.status)),true);
+    }
+  };
+  xhr.onerror=function(){$("go").disabled=false;setStatus("Connection error — check you're still on the SecureKey WiFi.",true)};
+  xhr.send(fd);
+}
+</script></body></html>)HTML";

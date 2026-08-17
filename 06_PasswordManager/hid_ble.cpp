@@ -34,7 +34,7 @@
 #if HID_BLE_ENABLE
   #include <BleKeyboard.h>
   #include <NimBLEDevice.h>
-  static BleKeyboard kb("SecureKey", "techiesms", 100);
+  static BleKeyboard kb("SecureKey", "IndraOps", 100);
   static bool everStarted = false;   // kb.begin() may only EVER run once/boot
   static bool active      = false;   // advertising / accepting connections?
   static bool androidFix  = false;   // UK/Android layout: swap @ <-> " keycodes

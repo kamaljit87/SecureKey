@@ -81,6 +81,16 @@ void onTapMigrate(int16_t tx, int16_t ty) {
     drawAll();
     if (ok) {
       delay(1400);
+      // dbMigrateLegacyPlaintext() always writes a v2-format database (see
+      // db_migrate.ino's header comment) — it never had folder data, so the
+      // v2->v3 migration is a trivial/instant no-op-shaped pass here, but
+      // running it now (rather than waiting for the NEXT unlock) means the
+      // freshly-migrated vault is already on the current format the moment
+      // setup finishes, and dbLoadIndex() below has a real folder index to
+      // resolve against instead of relying on the placeholder fallback.
+      foldersLoadIndex();
+      if (dbV3MigrationNeeded()) dbMigrateV3Folders();
+      foldersLoadIndex();
       navTop = 0; navStack[0] = SCR_HOME; current = SCR_HOME;
       drawAll();
     }

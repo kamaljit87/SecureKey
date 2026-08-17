@@ -85,8 +85,14 @@ enum Screen {
   SCR_DEVICES,         // saved BLE devices manager (whitelist)
   SCR_SETUP_PIN,       // first-boot / post-factory-reset: choose a new PIN
   SCR_MIGRATE,         // one-time legacy-plaintext-DB → encrypted DB migration
-  SCR_MEDIA            // media/volume controller — the default "resting" screen
+  SCR_MEDIA,           // media/volume controller — the default "resting" screen
                         // (vault stays LOCKED here; see media_control.ino)
+  SCR_MIGRATE_V3,      // one-time v2→v3 folder-format migration (db_migrate_v3.ino)
+  SCR_IMPORT_SOURCE,   // Settings → Import: choose General WiFi vs Bitwarden
+  SCR_IMPORT_WAIT,     // Bitwarden import: waiting for the browser upload
+  SCR_IMPORT_PREVIEW,  // Bitwarden import: counts-only preview before commit
+  SCR_IMPORT_PROGRESS, // Bitwarden import: building + verifying the new vault
+  SCR_IMPORT_DONE      // Bitwarden import: final result summary
 };
 
 // ── Password record (256 bytes fixed) ─────────────────────────

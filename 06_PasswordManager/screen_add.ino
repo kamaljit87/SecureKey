@@ -1,10 +1,14 @@
 // =============================================================
 //  screen_add.ino  —  Add / edit a password (multi-step form)
 //
-//  5 fields, one at a time:
-//     TITLE → USER → PASS → URL → NOTE
+//  6 fields, one at a time:
+//     TITLE → USER → PASS → URL → FOLDER → NOTE
 //
-//  Each "OK" on the keyboard advances to the next field.
+//  Each "OK" on the keyboard advances to the next field. The FOLDER step is
+//  special: instead of the keyboard, it shows a picker overlay (existing
+//  folders + "No Folder" + "+ New Folder") — see drawFolderPicker()/
+//  onTapFolderPicker() below.
+//
 //  After NOTE: appends a new PassRecord to FFat, reloads
 //  the index, and returns directly to the Passwords list with
 //  the new entry visible.
@@ -17,18 +21,30 @@
 static uint8_t    addField = 0;
 static PassRecord addRec;
 
-static const char *FIELD_LABELS[5] = {
-  "TITLE", "USERNAME", "PASSWORD", "URL", "NOTE"
+// Folder picker sub-mode (a sub-mode of SCR_ADD, not its own top-level
+// screen — same pattern as the PASSWORD field's GENERATE button being a
+// sub-mode rather than a separate screen). addPickingNewFolder distinguishes
+// "showing the picker list" from "typing a brand-new folder name" (which
+// reuses the normal keyboard UI).
+static bool addPickingFolder    = false;
+static bool addPickingNewFolder = false;
+
+#define FIELD_COUNT 6
+static const char *FIELD_LABELS[FIELD_COUNT] = {
+  "TITLE", "USERNAME", "PASSWORD", "URL", "FOLDER", "NOTE"
 };
-static const char *FIELD_HINTS[5] = {
+static const char *FIELD_HINTS[FIELD_COUNT] = {
   "e.g. Amazon", "user@example.com", "your password",
-  "www.example.com", "optional"
+  "www.example.com", "tap to choose", "optional"
 };
+#define FIELD_FOLDER 4
 
 // ── Reset state before entering Add screen ───────────────────
 void addInit() {
   ckSecureZero(&addRec, sizeof(addRec));
   addField = 0;
+  addPickingFolder = false;
+  addPickingNewFolder = false;
   kbReset();
 }
 
@@ -38,20 +54,27 @@ void addInit() {
 void addEditInit(const PassRecord &rec) {
   addRec   = rec;
   addField = 0;
+  addPickingFolder = false;
+  addPickingNewFolder = false;
   kbReset();
   loadFromField(0);     // prefill the first field (TITLE) into the kb buffer
 }
 
 // ── Save kb input into addRec for the current field ──────────
+// Case 3 (URL) used to ALSO silently overwrite addRec.folder with the URL
+// text — that was a bug (folders never actually worked; the "folder"
+// subtext shown on list rows was really just a URL copy). URL and folder
+// are now fully independent fields.
 static void copyToField(uint8_t f, const char *src) {
   switch (f) {
     case 0: strncpy(addRec.title,    src, sizeof(addRec.title)    - 1); break;
     case 1: strncpy(addRec.username, src, sizeof(addRec.username) - 1); break;
     case 2: strncpy(addRec.password, src, sizeof(addRec.password) - 1); break;
-    case 3: { strncpy(addRec.url,    src, sizeof(addRec.url)      - 1);
-              strncpy(addRec.folder, src, sizeof(addRec.folder)   - 1);
-              break; }
-    case 4: strncpy(addRec.note,     src, sizeof(addRec.note)     - 1); break;
+    case 3: strncpy(addRec.url,      src, sizeof(addRec.url)      - 1); break;
+    // case FIELD_FOLDER (4) is handled separately by the picker/"+ New
+    // Folder" flow — see onTapFolderPicker() — not by this keyboard-submit
+    // path, so there's no case 4 here.
+    case 5: strncpy(addRec.note,     src, sizeof(addRec.note)     - 1); break;
   }
 }
 
@@ -63,7 +86,9 @@ static void loadFromField(uint8_t f) {
     case 1: src = addRec.username; break;
     case 2: src = addRec.password; break;
     case 3: src = addRec.url;      break;
-    case 4: src = addRec.note;     break;
+    case 5: src = addRec.note;     break;
+    // case FIELD_FOLDER (4): nothing to prefill into the keyboard buffer —
+    // the picker reads addRec.folder (a folder-id string) directly.
   }
   strncpy(kbBuffer, src, KB_MAX_LEN);
   kbBuffer[KB_MAX_LEN] = 0;
@@ -113,9 +138,33 @@ static void drawSavedSplash() {
 }
 
 // ── Called by keyboard.ino → onKeyboardSubmit (OK key) ───────
+// NOTE: FIELD_FOLDER (4) never reaches this path via the normal keyboard OK
+// key — the picker advances the field directly (see onTapFolderPicker()).
+// This function's addField==FIELD_FOLDER branch only exists to handle the
+// "+ New Folder" keyboard submission, which routes back here.
 void addNextField() {
+  if (addPickingNewFolder) {
+    // Submitting a brand-new folder name from the keyboard (routed here by
+    // keyboard.ino's normal OK-key path, since the "+ New Folder" step
+    // reuses the shared keyboard UI). Empty name = treat as cancel.
+    if (kbLen > 0) {
+      uint16_t fid = folderIdForName(kbBuffer);
+      char idStr[PT_FOLDER_LEN];
+      snprintf(idStr, sizeof(idStr), "%u", fid);
+      memset(addRec.folder, 0, sizeof(addRec.folder));
+      strncpy(addRec.folder, idStr, sizeof(addRec.folder) - 1);
+    }
+    addPickingNewFolder = false;
+    addPickingFolder = false;
+    addField++;
+    kbReset();
+    if (addField < FIELD_COUNT) loadFromField(addField);
+    drawAdd();
+    return;
+  }
+
   // Required-field validation: TITLE (0), USER (1), PASS (2) cannot be
-  // empty.  URL (3) and NOTE (4) are optional.
+  // empty.  URL (3), FOLDER (4) and NOTE (5) are optional.
   bool isRequired = (addField <= 2);
   if (isRequired && kbLen == 0) {
     // No nag popup. The OK button simply stays white (not blue) to show the
@@ -126,7 +175,7 @@ void addNextField() {
   copyToField(addField, kbBuffer);
   addField++;
 
-  if (addField >= 5) {
+  if (addField >= FIELD_COUNT) {
     saveNewRecord();
     drawSavedSplash();
     delay(700);
@@ -137,6 +186,8 @@ void addNextField() {
     // everything out.) addRec/kbBuffer held a plaintext password during
     // this whole flow — securely wipe both now that they're saved.
     addField = 0;
+    addPickingFolder = false;
+    addPickingNewFolder = false;
     ckSecureZero(&addRec, sizeof(addRec));
     kbReset();
     editingId      = 0;
@@ -150,8 +201,108 @@ void addNextField() {
     return;
   }
 
-  loadFromField(addField);
+  if (addField == FIELD_FOLDER) {
+    // Enter the picker sub-mode instead of the normal keyboard step.
+    addPickingFolder = true;
+  } else {
+    loadFromField(addField);
+  }
   drawAdd();
+}
+
+// ── Folder picker (sub-mode of the FOLDER field) ─────────────────────────
+// Row 0 = "No Folder", rows 1..N = existing folders (from the in-RAM index
+// — folders.ino), final row = "+ New Folder". Scrolling isn't implemented
+// (MAX_FOLDERS=256 could in theory overflow one screen, but in practice a
+// handful of folders is the common case; a future pass could add the same
+// scroll idiom screen_list.ino already uses if this becomes a real
+// limitation — noted, not blocking for this feature).
+#define FP_ROW_Y0  (STATUS_H + NAV_H + 8)
+#define FP_ROW_H   46
+#define FP_ROW_GAP 6
+
+static uint8_t fpVisibleRows() {
+  // No-Folder + existing folders + New-Folder, capped to what fits on screen.
+  uint16_t n = 2 + foldersCount();
+  uint16_t maxFit = (uint16_t)((LCD_HEIGHT - FP_ROW_Y0 - 40) / (FP_ROW_H + FP_ROW_GAP));
+  return (uint8_t)(n < maxFit ? n : maxFit);
+}
+
+static void drawFolderPicker() {
+  textCenter(STATUS_H + NAV_H + 4, "Choose a folder", 1, C_GRAY_4);
+
+  uint16_t curFid = (uint16_t)atoi(addRec.folder);
+  uint8_t rows = fpVisibleRows();
+  uint16_t existing = foldersCount();
+
+  for (uint8_t i = 0; i < rows; i++) {
+    int16_t y = FP_ROW_Y0 + i * (FP_ROW_H + FP_ROW_GAP);
+    bool isNoFolder = (i == 0);
+    bool isNewFolder = (i == rows - 1) && (i >= existing + 1);
+    bool sel = false;
+    char label[PT_FOLDER_NAME_LEN + 8] = {0};
+
+    if (isNoFolder) {
+      strncpy(label, "No Folder", sizeof(label) - 1);
+      sel = (curFid == 0);
+    } else if (isNewFolder) {
+      strncpy(label, "+ New Folder", sizeof(label) - 1);
+    } else {
+      uint16_t fid; char fname[PT_FOLDER_NAME_LEN];
+      if (foldersGetAt(i - 1, fid, fname, sizeof(fname))) {
+        strncpy(label, fname, sizeof(label) - 1);
+        sel = (curFid == fid);
+      }
+    }
+
+    uint16_t bg = sel ? C_GRAY_2 : C_GRAY_1;
+    uint16_t bd = sel ? C_BLUE   : C_GRAY_2;
+    gfx->fillRoundRect(SAFE_PAD, y, LCD_WIDTH - 2*SAFE_PAD, FP_ROW_H, 10, bg);
+    gfx->drawRoundRect(SAFE_PAD, y, LCD_WIDTH - 2*SAFE_PAD, FP_ROW_H, 10, bd);
+    textClipped(SAFE_PAD + 14, y + (FP_ROW_H - 14) / 2, label, 2,
+               isNewFolder ? C_BLUE : C_WHITE, LCD_WIDTH - 2*SAFE_PAD - 28);
+  }
+}
+
+static void onTapFolderPicker(int16_t tx, int16_t ty) {
+  uint8_t rows = fpVisibleRows();
+  uint16_t existing = foldersCount();
+
+  for (uint8_t i = 0; i < rows; i++) {
+    int16_t y = FP_ROW_Y0 + i * (FP_ROW_H + FP_ROW_GAP);
+    if (ty < y || ty >= y + FP_ROW_H) continue;
+
+    bool isNoFolder  = (i == 0);
+    bool isNewFolder = (i == rows - 1) && (i >= existing + 1);
+
+    if (isNoFolder) {
+      memset(addRec.folder, 0, sizeof(addRec.folder));
+      addPickingFolder = false;
+      addField++;
+      if (addField < FIELD_COUNT) loadFromField(addField);
+      drawAdd();
+      return;
+    }
+    if (isNewFolder) {
+      addPickingNewFolder = true;
+      kbReset();
+      drawAdd();
+      return;
+    }
+    // Existing folder row
+    uint16_t fid; char fname[PT_FOLDER_NAME_LEN];
+    if (foldersGetAt(i - 1, fid, fname, sizeof(fname))) {
+      char idStr[PT_FOLDER_LEN];
+      snprintf(idStr, sizeof(idStr), "%u", fid);
+      memset(addRec.folder, 0, sizeof(addRec.folder));
+      strncpy(addRec.folder, idStr, sizeof(addRec.folder) - 1);
+    }
+    addPickingFolder = false;
+    addField++;
+    if (addField < FIELD_COUNT) loadFromField(addField);
+    drawAdd();
+    return;
+  }
 }
 
 // ── Draw ──────────────────────────────────────────────────────
@@ -160,9 +311,15 @@ void drawAdd() {
   drawStatusBar();
 
   char navT[32];
-  snprintf(navT, sizeof(navT), "%s  %u/5",
-           editingId == 0 ? "Add New" : "Edit", addField + 1);
-  drawNavBar(navT, true, "OK");
+  snprintf(navT, sizeof(navT), "%s  %u/%u",
+           editingId == 0 ? "Add New" : "Edit", addField + 1, (unsigned)FIELD_COUNT);
+  drawNavBar(navT, true, addPickingFolder ? nullptr : "OK");
+
+  if (addPickingFolder) {
+    drawFolderPicker();
+    flushScreen();
+    return;
+  }
 
   // OK button: white when the field is empty, blue once you've typed
   // something — a clear "ready" cue instead of a nagging popup.
@@ -234,9 +391,25 @@ void drawAdd() {
 }
 
 void onTapAdd(int16_t tx, int16_t ty) {
+  bool back = (ty >= STATUS_H + 2 && ty < STATUS_H + NAV_H - 2
+               && tx >= SAFE_PAD && tx < SAFE_PAD + 46);
+
+  // Folder picker sub-mode intercepts taps before the normal field UI.
+  if (addPickingFolder) {
+    if (addPickingNewFolder) {
+      // "+ New Folder" reuses the shared keyboard UI — Back cancels typing
+      // and returns to the picker list rather than leaving the whole form.
+      if (back) { addPickingNewFolder = false; kbReset(); drawAdd(); return; }
+      if (kbHandleTap(tx, ty)) drawAdd();
+      return;
+    }
+    if (back) { addPickingFolder = false; drawAdd(); return; }
+    onTapFolderPicker(tx, ty);
+    return;
+  }
+
   // Back
-  if (ty >= STATUS_H + 2 && ty < STATUS_H + NAV_H - 2
-      && tx >= SAFE_PAD && tx < SAFE_PAD + 46) {
+  if (back) {
     addInit();
     popNav();
     return;

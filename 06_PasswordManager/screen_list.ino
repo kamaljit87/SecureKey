@@ -19,6 +19,22 @@ bool             listFavOnly    = false;        // Favorites tile → show only 
 static int16_t   listTopY   = LIST_TOP;
 static int16_t   listViewH  = LCD_HEIGHT - LIST_TOP;
 
+// ── Lowercase search cache ───────────────────────────────────
+// buildList() runs on every keystroke while searching — with a large vault,
+// re-lowercasing every title/folder from scratch each time repeats identical
+// work every keystroke. Instead, a case-folded copy of each entry's title +
+// folder is cached here ONCE whenever passwordIndex changes (populated by
+// dbLoadIndex() via listCacheFold() below), and buildList() just strstr()s
+// against the cache. Same PSRAM-once-at-boot pattern as listSortedIdx; same
+// size as the fields it mirrors (ListItem.title[40]/folder[21] — theme.h),
+// so results are byte-identical to lowercasing on the fly, just not redone
+// 40 times a second while someone types.
+struct ListFoldEntry {
+  char title[40];
+  char folder[21];
+};
+static ListFoldEntry *listFold = nullptr;
+
 static inline int32_t listMaxScroll() {
   int32_t total = (int32_t)listCount * LIST_ITEM_H - listViewH;
   return total > 0 ? total : 0;
@@ -27,6 +43,28 @@ static inline int32_t listMaxScroll() {
 static void listInit() {
   if (!listSortedIdx)
     listSortedIdx = (uint16_t *)ps_malloc(MAX_PASSWORDS * sizeof(uint16_t));
+  if (!listFold)
+    listFold = (ListFoldEntry *)ps_malloc(MAX_PASSWORDS * sizeof(ListFoldEntry));
+}
+
+// Populate the fold cache for entry `i` from the live passwordIndex[i] —
+// called by dbLoadIndex() (storage.ino) right after it fills each ListItem,
+// so the cache is always in lockstep with the index it mirrors. A no-op
+// (safe) if the PSRAM allocation hasn't happened yet — listInit() is called
+// from every draw path before buildList() reads it, so a stale/empty cache
+// is never actually consulted before it's filled.
+void listCacheFold(uint16_t i) {
+  listInit();
+  if (!listFold || i >= MAX_PASSWORDS) return;
+  ListFoldEntry &fe = listFold[i];
+  uint8_t n = 0;
+  for (; n < sizeof(fe.title) - 1 && passwordIndex[i].title[n]; n++)
+    fe.title[n] = (char)tolower((unsigned char)passwordIndex[i].title[n]);
+  fe.title[n] = 0;
+  n = 0;
+  for (; n < sizeof(fe.folder) - 1 && passwordIndex[i].folder[n]; n++)
+    fe.folder[n] = (char)tolower((unsigned char)passwordIndex[i].folder[n]);
+  fe.folder[n] = 0;
 }
 
 static int cmpTitle(const void *a, const void *b) {
@@ -50,18 +88,29 @@ void buildList() {
   for (uint16_t i = 0; i < passwordCount; i++) {
     if (listFavOnly && !passwordIndex[i].favorite) continue;   // Favorites view
     if (qlen > 0) {
-      char tlow[64];  int n = 0;
-      for (; n < 63 && passwordIndex[i].title[n]; n++)
-        tlow[n] = tolower(passwordIndex[i].title[n]);
-      tlow[n] = 0;
-      if (strstr(tlow, q) == nullptr) {
-        // also check URL/folder
-        char flow[24]; n = 0;
+      // Case-folded title/folder come from the cache populated once by
+      // dbLoadIndex() (listCacheFold(), above) — same bytes as lowercasing
+      // passwordIndex[i] right here, just not redone on every keystroke.
+      // Fall back to folding on the fly if the cache isn't ready yet (e.g.
+      // called before any dbLoadIndex() has run) so results are never wrong,
+      // only occasionally not yet cached.
+      const char *tlow, *flow;
+      char tlowBuf[64], flowBuf[24];
+      if (listFold) {
+        tlow = listFold[i].title;
+        flow = listFold[i].folder;
+      } else {
+        int n = 0;
+        for (; n < 63 && passwordIndex[i].title[n]; n++)
+          tlowBuf[n] = tolower(passwordIndex[i].title[n]);
+        tlowBuf[n] = 0;
+        n = 0;
         for (; n < 23 && passwordIndex[i].folder[n]; n++)
-          flow[n] = tolower(passwordIndex[i].folder[n]);
-        flow[n] = 0;
-        if (strstr(flow, q) == nullptr) continue;
+          flowBuf[n] = tolower(passwordIndex[i].folder[n]);
+        flowBuf[n] = 0;
+        tlow = tlowBuf; flow = flowBuf;
       }
+      if (strstr(tlow, q) == nullptr && strstr(flow, q) == nullptr) continue;
     }
     listSortedIdx[listCount++] = i;
   }

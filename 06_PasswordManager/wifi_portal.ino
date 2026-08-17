@@ -26,6 +26,22 @@
 //    • WPA2 with a fresh RANDOM password each session (shown only on the
 //      device screen — see the "never log" note by wifiPortalStart()).
 //
+//  ── Bitwarden import mode ─────────────────────────────────────────────
+//  A SECOND mode of the SAME portal instance/SoftAP session (not a second
+//  radio/server — see wifiPortalStartCommon()), reached via Settings ->
+//  Import -> Bitwarden (screen_import.ino), gated behind an explicit
+//  on-device plaintext-data warning the user must accept BEFORE the AP
+//  even comes up. Registers a DELIBERATELY RESTRICTED route set — NOT
+//  /save, /list, /edit, /delete, /export — so an import session's web page
+//  has no path to browse or export the existing vault (least privilege;
+//  see wifiPortalStartImportMode()). The upload itself uses a REAL
+//  multipart file upload (ESP32 WebServer's HTTPUpload chunked callback,
+//  ~1436 bytes/call) fed directly into the streaming Bitwarden JSON parser
+//  (bw_json_parser.h/bw_import.ino) — the raw JSON is never buffered
+//  whole, never written to flash; only already-parsed/normalized fields
+//  are staged (see bw_import.ino's own header comment for the full
+//  security model of that staging file).
+//
 //  Built-in libs only (WiFi / WebServer / DNSServer) — no deps.
 // =============================================================
 #include <WiFi.h>
@@ -43,6 +59,7 @@ static uint32_t   portalLastSeen = 0;     // for idle auto-off
 static uint32_t   portalStartedAt = 0;    // for the hard session cap
 static int        portalImported = 0;     // running count (for the screen)
 static bool       portalNeedReload = false;
+static bool       portalImportMode = false;   // false = general manager, true = Bitwarden import
 
 // Hard cap on how long the portal can stay up in one session REGARDLESS of
 // request activity — bounds "device left unattended with the import screen
@@ -51,7 +68,11 @@ static bool       portalNeedReload = false;
 #define PORTAL_MAX_SESSION_MS   600000UL   // 10 minutes
 
 // ── Accessors for the Settings screen ────────────────────────────────
+// SSID/password/code/IP accessors are mode-agnostic — both the general
+// manager (screen_wifi.ino) and the Bitwarden-import "waiting" screen
+// (screen_import.ino) read the SAME live session credentials.
 bool        wifiPortalActive()   { return portalActive; }
+bool        wifiPortalImportModeActive() { return portalActive && portalImportMode; }
 const char* wifiPortalSsid()     { return portalSsid; }
 const char* wifiPortalPass()     { return portalPass; }
 const char* wifiPortalCode()     { return portalCode; }
@@ -279,14 +300,121 @@ static void portalHandleExport() {
   portalSrv.sendContent("");
 }
 
+// ── Bitwarden import routes (import mode only) ───────────────────────
+// Serves the SEPARATE minimal upload page (portal_html.h's PORTAL_IMPORT_HTML,
+// not the general-manager PORTAL_HTML) — repeats the plaintext-data warning
+// at the point of action (choosing/uploading the file), on top of the
+// mandatory on-device confirm the user already passed through before the
+// AP even came up (screen_import.ino).
+static void portalSendImportHtml() {
+  portalLastSeen = millis();
+  portalSrv.send_P(200, "text/html", PORTAL_IMPORT_HTML);
+}
+
+// The CSRF/session code for this multipart upload travels as a QUERY
+// STRING param (?code=123456), NOT a form field — WebServer::arg() reads
+// query args regardless of body content-type, same mechanism the existing
+// GET /list and /export routes already rely on. A multipart BODY's fields
+// are not parsed into arg() at all by this WebServer version, only exposed
+// via the HTTPUpload struct below.
+static bool portalImportCodeOk() {
+  return vaultUnlocked && portalImportMode &&
+         portalSrv.arg("code") == String(portalCode);
+}
+
+// Streaming upload callback — called repeatedly as the multipart body
+// arrives, ~1436 bytes per call (HTTP_UPLOAD_BUFLEN). Feeds bytes DIRECTLY
+// into the Bitwarden JSON parser (bw_import.ino) with no intermediate
+// copy — the raw upload buffer is owned/reused by the WebServer library
+// between calls, so there is nothing here for THIS code to separately wipe.
+static bool s_importUploadOk = false;   // set false on any failure; UPLOAD_FILE_WRITE
+                                        // keeps draining bytes either way so the
+                                        // connection doesn't hang, but stops staging.
+static void portalImportUploadChunk() {
+  HTTPUpload &upload = portalSrv.upload();
+  portalLastSeen = millis();   // bump on EVERY chunk — a slow-but-active upload
+                               // must not trip the 3-minute idle timeout mid-transfer
+
+  switch (upload.status) {
+    case UPLOAD_FILE_START:
+      s_importUploadOk = portalImportCodeOk();
+      if (!s_importUploadOk) {
+        SK_LOGLN("[BWIMPORT] upload rejected: bad code or vault locked");
+        return;
+      }
+      // bwImportBegin() already ran when the portal entered import mode
+      // (wifiPortalStartImportMode()) — nothing further to initialize here.
+      break;
+
+    case UPLOAD_FILE_WRITE:
+      if (!s_importUploadOk) return;   // draining bytes, not staging them
+      if (!bwImportFeed(upload.buf, upload.currentSize)) {
+        s_importUploadOk = false;      // parser errored — stop staging, keep draining
+      }
+      break;
+
+    case UPLOAD_FILE_END:
+      // Finalization happens in portalImportUploadDone() (the `fn` callback,
+      // called once after the whole request completes) — nothing to do here.
+      break;
+
+    case UPLOAD_FILE_ABORTED:
+      SK_LOGLN("[BWIMPORT] upload aborted by client");
+      bwImportDiscard();
+      s_importUploadOk = false;
+      break;
+  }
+}
+
+// Called once after the full multipart request completes (success or the
+// client disconnected — WebServer still invokes this). Sends the actual
+// HTTP response.
+static void portalImportUploadDone() {
+  if (!portalImportCodeOk()) {
+    portalSrv.send(403, "text/plain", "bad code or vault locked");
+    return;
+  }
+  if (!s_importUploadOk) {
+    portalSrv.send(400, "text/plain", "upload failed");
+    return;
+  }
+  bool ok = bwImportEnd();
+  if (!ok) {
+    portalSrv.send(400, "text/plain", bwImportErrorMsg());
+    return;
+  }
+  // Success — the device screen (SCR_IMPORT_WAIT, polled ~1 Hz) will notice
+  // BwImportCtx reached AWAITING_PREVIEW and auto-advance to the preview
+  // screen on its own; this HTTP response just confirms upload success to
+  // the browser.
+  portalSrv.send(200, "text/plain", "ok");
+}
+
+// POST /import/bitwarden/cancel?code=XXX — user cancelled from the phone's
+// browser instead of the device (both paths are supported; the on-device
+// CANCEL button on SCR_IMPORT_WAIT/SCR_IMPORT_PREVIEW calls bwImportDiscard()
+// directly without going through HTTP).
+static void portalImportCancel() {
+  if (!portalImportCodeOk()) { portalSrv.send(403, "text/plain", "bad code"); return; }
+  bwImportDiscard();
+  SK_LOGLN("[BWIMPORT] import cancelled by user (web)");
+  portalSrv.send(200, "text/plain", "ok");
+}
+
 // ── Public control ───────────────────────────────────────────────────
-void wifiPortalStart() {
-  if (portalActive) return;
+// Shared setup for BOTH modes: fresh random WPA2 password + 6-digit code,
+// the BLE-coexistence restart-bug mitigation, and bringing up the SoftAP +
+// DNS. Does NOT register any HTTP routes or call portalSrv.begin() —
+// callers (wifiPortalStart()/wifiPortalStartImportMode()) register their
+// own mode-specific route set afterward. Returns false (leaving the caller
+// to bail out) if the vault isn't unlocked or the AP is already active.
+static bool wifiPortalStartCommon() {
+  if (portalActive) return false;
   // Fail closed: never start the portal (and never expose vault routes)
   // if the device somehow isn't unlocked. Settings is only reachable
   // post-PIN, so this should be unreachable in normal use — defense in
   // depth against a future navigation bug.
-  if (!vaultUnlocked) return;
+  if (!vaultUnlocked) return false;
 
   // Fresh random WPA2 password + 6-digit code each session. Uses
   // ckRandomBytes() (the same HW-RNG wrapper used for every other secret
@@ -330,6 +458,12 @@ void wifiPortalStart() {
   SK_LOG("[WIFI] post-start heap: free=%u minfree=%u\n",
          ESP.getFreeHeap(), ESP.getMinFreeHeap());
   portalDns.start(53, "*", WiFi.softAPIP());     // all domains → us
+  return true;
+}
+
+void wifiPortalStart() {
+  portalImportMode = false;
+  if (!wifiPortalStartCommon()) return;
 
   portalSrv.on("/",       HTTP_GET,  portalSendHtml);
   portalSrv.on("/save",   HTTP_POST, portalHandleSave);
@@ -349,6 +483,29 @@ void wifiPortalStart() {
          portalSsid, WiFi.softAPIP().toString().c_str());
 }
 
+// Bitwarden import mode: SAME portal instance/SoftAP session as above (no
+// second radio/server), but a DELIBERATELY RESTRICTED route set — no
+// /save, /list, /edit, /delete, /export, so an import session's web page
+// has no path to browse or export the existing vault. See
+// portalImportUploadChunk()/portalImportUploadDone() below.
+void wifiPortalStartImportMode() {
+  portalImportMode = true;
+  if (!wifiPortalStartCommon()) return;
+
+  bwImportBegin();   // resets BwImportCtx, opens the staging files
+
+  portalSrv.on("/", HTTP_GET, portalSendImportHtml);
+  portalSrv.on("/import/bitwarden/upload", HTTP_POST,
+              portalImportUploadDone, portalImportUploadChunk);
+  portalSrv.on("/import/bitwarden/cancel", HTTP_POST, portalImportCancel);
+  portalSrv.onNotFound(portalHandleNotFound);
+  portalSrv.begin();
+
+  portalActive = true; portalLastSeen = millis(); portalStartedAt = millis();
+  SK_LOG("[WIFI] import portal up: SSID=%s IP=%s (password/code shown on-device only)\n",
+         portalSsid, WiFi.softAPIP().toString().c_str());
+}
+
 void wifiPortalStop() {
   if (!portalActive) return;
   portalSrv.stop();
@@ -357,6 +514,16 @@ void wifiPortalStop() {
   WiFi.mode(WIFI_OFF);
   portalActive = false;
   SK_LOGLN("[WIFI] portal stopped");
+
+  // If a Bitwarden import was in-flight when the portal was torn down
+  // (device locked, idle timeout, nav-away, hard session cap), discard any
+  // staged plaintext immediately — the portal must never leave orphaned
+  // staging data behind just because it stopped mid-transfer.
+  if (portalImportMode && bwImportStage() != BWI_IDLE &&
+      bwImportStage() != BWI_DONE) {
+    bwImportDiscard();
+  }
+  portalImportMode = false;
 
   // Bring BLE back if we shut it down for the AP.
   if (portalBleWasOn && settings.bleEnabled && hidBleCompiled()) {

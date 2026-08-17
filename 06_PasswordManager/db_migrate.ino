@@ -126,7 +126,15 @@ bool dbMigrateLegacyPlaintext() {
 
     DbHeader hdr;
     memcpy(hdr.magic, DB_MAGIC, 4);
-    hdr.formatVersion   = DB_FORMAT_VERSION;
+    // Deliberately hardcoded to 2, NOT DB_FORMAT_VERSION: this migration only
+    // ever produces the ORIGINAL encrypted-payload layout (PassRecord.folder
+    // still holds a raw string here, copied verbatim from the legacy v1
+    // record below) — never the v3 folder-ID semantics. Writing formatVersion
+    // 2 here (regardless of what DB_FORMAT_VERSION currently is) means the
+    // v2->v3 migration (db_migrate_v3.ino) correctly picks this database up
+    // and converts it on the very next unlock, exactly as if a pre-v3
+    // firmware had produced it. Do not change this to DB_FORMAT_VERSION.
+    hdr.formatVersion   = 2;
     hdr.securityVersion = SECURITY_VERSION;
     hdr.recordCount     = 0;             // patched below once we know the count
     hdr.reserved        = 0;

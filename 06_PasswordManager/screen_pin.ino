@@ -162,11 +162,36 @@ static void pinUnlockSuccess() {
   pinRegisterSuccess();
   ledSet(0x00FF00, 200);
   fadeOut();
+
+  // v2->v3 folder-format migration (db_migrate_v3.ino / screen_migrate_v3.ino)
+  // runs on every normal unlock of an EXISTING vault, not just at first boot
+  // — unlike the older v1-plaintext migration, this one only matters once a
+  // real database already exists. Checked BEFORE foldersLoadIndex()/
+  // dbLoadIndex() below, since dbLoadIndex() now depends on the folder table
+  // to resolve names.
+  if (dbV3MigrationNeeded()) {
+    // foldersLoadIndex() first — /folders.bin may not exist yet (first-ever
+    // migration on this device), in which case it's a safe no-op (index
+    // starts empty), but on a RETRY after a previous failed attempt any
+    // folders already created must be loaded so folderIdForName() doesn't
+    // create duplicates.
+    foldersLoadIndex();
+    navTop = 0;
+    navStack[0] = SCR_MIGRATE_V3;
+    current = SCR_MIGRATE_V3;
+    migrateV3Init();
+    drawAll();
+    fadeIn();
+    migrateV3Run();   // synchronous — see screen_migrate_v3.ino
+    return;
+  }
+
   navTop = 0;
   navStack[0] = SCR_HOME;
   current = SCR_HOME;
 
   // Load the encrypted vault now that the master key is in RAM.
+  foldersLoadIndex();
   dbLoadIndex();
   SK_LOG("[DB] %u passwords loaded\n", passwordCount);
 

@@ -11,6 +11,15 @@ further in production. It also states plainly what this architecture does
 primitive is a call into mbedTLS (bundled with the ESP32 Arduino core) or the
 ESP32-S3 hardware RNG — see [Cryptographic primitives used](#cryptographic-primitives-used).
 
+The WiFi import/export portal described in this document (Threat #10 in the
+table below) also has a second mode — Bitwarden vault import — with its own
+additional threat-model specifics (a restricted route set, streaming-parser
+memory bounds, atomic verify-before-swap semantics, and what temporary
+plaintext data is unavoidable and why). See
+[`docs/BITWARDEN_IMPORT.md`](BITWARDEN_IMPORT.md) for that extension of the
+threat model; this document remains the single source of truth for the
+overall vault architecture both features build on.
+
 ---
 
 ## 1. Threat model

@@ -85,6 +85,12 @@ extern "C" {
 #include "esp_system.h"     // esp_reset_reason() — logged at boot
 #include "crypto_core.h"    // PBKDF2 / AES-256-GCM / CSPRNG / secure-wipe wrappers
 #include "shared_types.h"      // encrypted-DB on-disk layout + SECURITY_VERSION
+#include "bw_json_parser.h"    // Bitwarden streaming-JSON-parser types (BwParsedItem/
+                                // BwParsedFolder/BwParserState) — included early, same
+                                // reasoning as shared_types.h: bw_import.ino's functions
+                                // take these structs by reference, and Arduino's auto-
+                                // prototype hoisting needs the types visible before that,
+                                // regardless of which file actually defines them.
 
 // vault_crypto.ino's vaultPinLength() is used a few lines below (in
 // pinRefreshLength()) — earlier than Arduino's auto-generated function
@@ -275,6 +281,14 @@ void drawDevices();   void onTapDevices(int16_t,int16_t);   void devicesInit();
 void drawSetupPin();  void onTapSetupPin(int16_t,int16_t);
 void drawMigrate();   void onTapMigrate(int16_t,int16_t);
 void drawMedia();     void onTapMedia(int16_t,int16_t);
+void drawMigrateV3(); void onTapMigrateV3(int16_t,int16_t); void migrateV3Init(); void migrateV3Run();
+void drawImportSource();   void onTapImportSource(int16_t,int16_t);
+void drawImportWait();     void onTapImportWait(int16_t,int16_t);
+void drawImportPreview();  void onTapImportPreview(int16_t,int16_t);
+void drawImportProgress(); void onTapImportProgress(int16_t,int16_t);
+void importProgressTick();
+void importWarnShow();
+void drawImportDone();     void onTapImportDone(int16_t,int16_t);
 void drawAll();
 
 // pwgen.ino (password generator, HW RNG) is textually ordered before
@@ -293,6 +307,7 @@ void textCenter(int16_t y, const char *s, uint8_t sz,
 void textAt(int16_t x, int16_t y, const char *s, uint8_t sz, uint16_t col);
 void listScroll(int16_t dy);
 void buildList();
+void listCacheFold(uint16_t i);   // screen_list.ino — search cache, filled by dbLoadIndex()
 void typeViaHID(const char *s);
 void saveSettings();
 void loadSettings();
@@ -333,6 +348,35 @@ bool dbMigrationNeeded();
 uint16_t dbMigrationLegacyCount();
 bool dbMigrateLegacyPlaintext();
 
+// db_migrate_v3.ino forward decls
+bool dbV3MigrationNeeded();
+bool dbMigrateV3Folders();
+
+// folders.ino forward decls
+bool foldersExists();
+bool foldersCreateEmpty();
+void foldersLoadIndex();
+uint16_t foldersCount();
+bool foldersGetAt(uint16_t idx, uint16_t &id, char *outName, size_t outLen);
+bool folderNameForId(uint16_t id, char *outName, size_t outLen);
+uint16_t folderIdForName(const char *name);
+
+// bw_import.ino forward decls — Bitwarden import pipeline
+bool bwImportBegin();
+bool bwImportFeed(const uint8_t *chunk, size_t len);
+bool bwImportEnd();
+bool bwImportCommit();
+void bwImportDiscard();
+int      bwImportStage();
+uint32_t bwImportLoginsFound();
+uint32_t bwImportNotesFound();
+uint32_t bwImportFoldersFound();
+uint32_t bwImportUnsupportedFound();
+uint32_t bwImportDuplicatesFound();
+uint32_t bwImportFinalNew();
+uint32_t bwImportFinalTotal();
+const char *bwImportErrorMsg();
+
 // PIN lockout helpers (defined later in this file)
 void pinRegisterFail();
 void pinRegisterSuccess();
@@ -355,6 +399,12 @@ void drawAll() {
     case SCR_SETUP_PIN:   drawSetupPin();  break;
     case SCR_MIGRATE:     drawMigrate();   break;
     case SCR_MEDIA:       drawMedia();     break;
+    case SCR_MIGRATE_V3:      drawMigrateV3();      break;
+    case SCR_IMPORT_SOURCE:   drawImportSource();   break;
+    case SCR_IMPORT_WAIT:     drawImportWait();     break;
+    case SCR_IMPORT_PREVIEW:  drawImportPreview();  break;
+    case SCR_IMPORT_PROGRESS: drawImportProgress(); break;
+    case SCR_IMPORT_DONE:     drawImportDone();     break;
     default:                               break;
   }
 }
@@ -381,6 +431,12 @@ void dispatchTap(int16_t tx, int16_t ty) {
     case SCR_SETUP_PIN:   onTapSetupPin(tx, ty);   break;
     case SCR_MIGRATE:     onTapMigrate(tx, ty);    break;
     case SCR_MEDIA:       onTapMedia(tx, ty);      break;
+    case SCR_MIGRATE_V3:      onTapMigrateV3(tx, ty);      break;
+    case SCR_IMPORT_SOURCE:   onTapImportSource(tx, ty);   break;
+    case SCR_IMPORT_WAIT:     onTapImportWait(tx, ty);     break;
+    case SCR_IMPORT_PREVIEW:  onTapImportPreview(tx, ty);  break;
+    case SCR_IMPORT_PROGRESS: onTapImportProgress(tx, ty); break;
+    case SCR_IMPORT_DONE:     onTapImportDone(tx, ty);     break;
     default:                                       break;
   }
 }
@@ -1002,9 +1058,14 @@ void screenSleep() {
 // ── Loop ─────────────────────────────────────────────────────────────
 void loop() {
   // WiFi captive-portal import: service the AP + web server when active.
-  // Safety: if we've navigated away from the WiFi screen by any means
-  // (SW2 → lock, auto-nothing), shut the portal down.
-  if (wifiPortalActive() && current != SCR_WIFI) wifiPortalStop();
+  // Safety: if we've navigated away from EVERY screen that legitimately
+  // keeps the portal up (the general manager's SCR_WIFI, or any step of the
+  // Bitwarden-import flow, which reuses the SAME portal instance in a
+  // restricted "import mode" — see wifi_portal.ino), shut the portal down.
+  bool onPortalScreen = (current == SCR_WIFI || current == SCR_IMPORT_WAIT ||
+                        current == SCR_IMPORT_PREVIEW || current == SCR_IMPORT_PROGRESS ||
+                        current == SCR_IMPORT_DONE);
+  if (wifiPortalActive() && !onPortalScreen) wifiPortalStop();
   wifiPortalLoop();
 
   // Lock screen: ~2 Hz repaint for the "tap to unlock" pulse
@@ -1037,11 +1098,19 @@ void loop() {
 
   // (UNLOCKED splash removed — PIN screen jumps straight to HOME)
 
-  // List inertia scroll (only when not in search mode)
+  // List inertia scroll (only when not in search mode). Capped at ~45 Hz
+  // (was ~60 Hz) — each tick is a FULL list redraw (drawList() clears and
+  // repaints the whole screen, then Arduino_Canvas::flush() blits the
+  // entire 368x448 framebuffer over QSPI; the library has no partial/
+  // dirty-rect blit to opt into), so this is real CPU/bus time saved on
+  // every fling. 45 Hz is still well above what the eye can distinguish
+  // from 60 Hz for a decelerating scroll, and the decay curve/feel is
+  // untouched — same 0.86 per-tick multiplier, just fired slightly less
+  // often, so a fling settles in the same number of *visible* steps.
   if (current == SCR_LIST && !listSearchMode &&
       fabsf(listVelocity) > 0.5f) {
     static uint32_t lastInertia = 0;
-    if (millis() - lastInertia > 16) {
+    if (millis() - lastInertia > 22) {
       lastInertia = millis();
       listScroll((int16_t)listVelocity);
       listVelocity *= 0.86f;
@@ -1213,9 +1282,26 @@ void loop() {
     drawWifi();
   }
 
+  // Bitwarden-import "waiting for upload" screen: same ~1 Hz refresh idiom
+  // as SCR_WIFI above (shows live SSID/password/code — mode-agnostic
+  // accessors, see wifi_portal.ino), and auto-advances to the preview screen
+  // once the upload completes (BwImportCtx.stage reaches AWAITING_PREVIEW).
+  static uint32_t lastImportWaitDraw = 0;
+  if (current == SCR_IMPORT_WAIT && millis() - lastImportWaitDraw > 1000) {
+    lastImportWaitDraw = millis();
+    drawImportWait();
+  }
+
   // Auto-lock after idle (security). Skipped on lock/PIN/media, and on the
   // flashlight + WiFi-import (no vault list shown, and they shouldn't be
-  // interrupted while in use).
+  // interrupted while in use). SCR_IMPORT_WAIT gets the SAME exemption as
+  // SCR_WIFI (waiting for the user to walk to their computer and export/
+  // upload a Bitwarden vault can legitimately take a few minutes) — but
+  // deliberately NOT the later import screens (preview/progress/done):
+  // those are short, active, in-hand steps handling PLAINTEXT passwords in
+  // a temp file, so idle auto-lock is intentionally allowed to interrupt
+  // them (wifiPortalLoop()'s existing !vaultUnlocked check then tears the
+  // portal down and wipes any staged plaintext — see wifi_portal.ino).
   // NOTE: this only collapses to the resting screen — the display stays ON
   // and touch stays live. It used to lightSleep() here, which darkened the
   // panel and gated wake on a double-tap: in QA that read as "touch randomly
@@ -1225,7 +1311,7 @@ void loop() {
   // popToLock() would just redraw the same screen it's already on.
   if (settings.autoLockSec > 0 && !screenOff &&
       current != SCR_LOCK && current != SCR_PIN && current != SCR_MEDIA &&
-      current != SCR_FLASH && current != SCR_WIFI &&
+      current != SCR_FLASH && current != SCR_WIFI && current != SCR_IMPORT_WAIT &&
       (millis() - lastActivityMs) > (uint32_t)settings.autoLockSec * 1000UL) {
     popToLock();
   }

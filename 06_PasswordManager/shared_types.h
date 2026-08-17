@@ -25,7 +25,12 @@
 #define DB_PATH      "/db.bin"
 #define DB_TMP_PATH  "/db_tmp.bin"
 #define DB_MAGIC     "SKV2"        // 4 bytes, no NUL
-#define DB_FORMAT_VERSION 2        // on-disk layout version
+#define DB_FORMAT_VERSION 3        // on-disk layout version — see db_migrate_v3.ino
+                                    // for what changed (v2->v3 is a SEMANTIC-only
+                                    // change: PassRecord.folder now holds a folder
+                                    // ID string, not a raw name — DbPlainPayload's
+                                    // byte layout is unchanged, so SECURITY_VERSION
+                                    // below is untouched).
 
 // KDF/crypto scheme version, stored in both the DB header and the
 // vault_crypto NVS params. Defined here (rather than in vault_crypto.ino)
@@ -141,3 +146,51 @@ struct PwGenOptions {
 struct McRect {
   int16_t x, y, w, h;
 };
+
+// =============================================================
+//  folders.ino's on-disk (encrypted) folder table — /folders.bin
+//
+//  A small, separate encrypted file, parallel in spirit to /db.bin but its
+//  own magic/header so the two can never be confused. Folder NAMES can be
+//  sensitive-adjacent (e.g. "Layoffs", "Affair") so they're individually
+//  AES-256-GCM encrypted with the SAME vaultMasterKey every other secret in
+//  this project uses — no second key, no separate crypto scheme.
+//
+//  PassRecord.folder[24] (theme.h) holds the DECIMAL STRING of a folder id
+//  from this table (e.g. "12", or empty for "no folder") — NOT a folder
+//  name directly. See folders.ino's folderNameForId()/folderIdForName().
+// =============================================================
+#define FOLDER_PATH           "/folders.bin"
+#define FOLDER_TMP_PATH       "/folders_tmp.bin"
+#define FOLDER_MAGIC          "SKF1"     // 4 bytes, distinct from DB_MAGIC
+#define FOLDER_FORMAT_VERSION 1
+#define PT_FOLDER_NAME_LEN    48         // generous vs. the old 24-byte PT_FOLDER_LEN
+#define MAX_FOLDERS           256        // sane cap — also the import limit
+
+struct __attribute__((packed)) FolderHeader {
+  char     magic[4];        // "SKF1"
+  uint16_t formatVersion;   // FOLDER_FORMAT_VERSION
+  uint16_t recordCount;     // informational only (live count comes from scanning)
+  uint16_t reserved;
+};
+static_assert(sizeof(FolderHeader) == 10, "FolderHeader layout changed");
+
+struct __attribute__((packed)) FolderPlainPayload {
+  char name[PT_FOLDER_NAME_LEN];
+};
+#define FOLDER_PAYLOAD_LEN sizeof(FolderPlainPayload)
+
+struct __attribute__((packed)) FolderRecordOnDisk {
+  uint16_t id;               // 1..MAX_FOLDERS; 0 is the "no folder" sentinel,
+                              // never assigned to a real folder record
+  uint8_t  deleted;
+  uint8_t  reserved;
+  uint8_t  nonce[CK_GCM_IV_LEN];
+  uint8_t  tag[CK_GCM_TAG_LEN];
+  uint8_t  ciphertext[FOLDER_PAYLOAD_LEN];
+};
+#define FOLDER_RECORD_SIZE sizeof(FolderRecordOnDisk)
+
+#define FOLDER_AAD_LEN 3   // id(2) + deleted(1) — mirrors DB_AAD_LEN's binding
+                            // reasoning: a byte-level swap can't quietly
+                            // reassign a folder ciphertext to a different id.

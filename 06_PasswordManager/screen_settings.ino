@@ -10,7 +10,8 @@
 //    • Brightness        (slider, 20–250)
 //    • Change PIN        (action)
 //    • Test HID Now      (action)
-//    • Import (WiFi)     (action)
+//    • Import             (action — opens a submenu: General WiFi Manager
+//                          or Bitwarden Import, see screen_import.ino)
 //    • About             (info)
 //    • Factory Reset     (action — PIN-gated)
 // =============================================================
@@ -146,7 +147,7 @@ void drawSettings() {
     {"Brightness",      1, false, settings.brightness, nullptr},
     {"Change PIN",      2, false, 0, nullptr},
     {"Test HID Now",    2, false, 0, nullptr},
-    {"Import (WiFi)",   2, false, 0, nullptr},
+    {"Import",          2, false, 0, nullptr},
     {"About",           2, false, 0, nullptr},
     {"Factory Reset",   2, false, 0, nullptr},
   };
@@ -203,7 +204,7 @@ static void drawAbout() {
 
   // Credit
   textCenter(y, "Developed by", 1, C_GRAY_3);        y += 18;
-  textCenter(y, "techiesms", 3, C_WHITE);
+  textCenter(y, "IndraOps", 3, C_WHITE);
 
   textCenter(LCD_HEIGHT - 36, "tap to go back", 1, C_GRAY_3);
   flushScreen();
@@ -540,10 +541,9 @@ void onTapSettings(int16_t tx, int16_t ty) {
   }
   y += step;
 
-  // Import (WiFi) — start the on-device captive portal, show its credentials
+  // Import — choose General WiFi Manager (unchanged) or Bitwarden Import.
   if (ty >= y && ty < y + SET_ITEM_H) {
-    wifiPortalStart();
-    pushNav(SCR_WIFI);
+    pushNav(SCR_IMPORT_SOURCE);
     return;
   }
   y += step;

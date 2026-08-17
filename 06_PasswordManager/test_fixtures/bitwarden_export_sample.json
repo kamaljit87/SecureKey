@@ -1,0 +1,103 @@
+{
+  "encrypted": false,
+  "folders": [
+    {"id": "f1-aaaa-bbbb-cccc-000000000001", "name": "Work"},
+    {"id": "f2-aaaa-bbbb-cccc-000000000002", "name": "Personal"}
+  ],
+  "items": [
+    {
+      "type": 1,
+      "name": "Example Mail",
+      "notes": "",
+      "folderId": "f2-aaaa-bbbb-cccc-000000000002",
+      "login": {
+        "username": "demo.user@example.invalid",
+        "password": "Demo-Pass-0001!",
+        "uris": [{"uri": "https://mail.example.invalid"}],
+        "totp": null
+      },
+      "fields": []
+    },
+    {
+      "type": 1,
+      "name": "Example Bank",
+      "notes": "Backup card in drawer",
+      "folderId": "f1-aaaa-bbbb-cccc-000000000001",
+      "login": {
+        "username": "demo.user@example.invalid",
+        "password": "Demo-Pass-0002!",
+        "uris": [
+          {"uri": "https://bank.example.invalid"},
+          {"uri": "https://secure.bank.example.invalid"}
+        ],
+        "totp": "JBSWY3DPEHPK3PXP"
+      },
+      "fields": []
+    },
+    {
+      "type": 1,
+      "name": "Example Shop",
+      "notes": "",
+      "folderId": null,
+      "login": {
+        "username": "shopper01",
+        "password": "Demo-Pass-0003!",
+        "uris": [{"uri": "https://shop.example.invalid"}],
+        "totp": null
+      },
+      "fields": [
+        {"name": "Security Question", "value": "Fake answer", "type": 0}
+      ]
+    },
+    {
+      "type": 1,
+      "name": "Example Social",
+      "notes": "",
+      "folderId": "f2-aaaa-bbbb-cccc-000000000002",
+      "login": {
+        "username": "demo_handle",
+        "password": "Demo-Pass-0004!",
+        "uris": [{"uri": "https://social.example.invalid"}],
+        "totp": null
+      },
+      "fields": []
+    },
+    {
+      "type": 1,
+      "name": "Example Mail",
+      "notes": "",
+      "folderId": "f2-aaaa-bbbb-cccc-000000000002",
+      "login": {
+        "username": "demo.user@example.invalid",
+        "password": "Demo-Pass-0001!",
+        "uris": [{"uri": "https://mail.example.invalid"}],
+        "totp": null
+      },
+      "fields": []
+    },
+    {
+      "type": 2,
+      "name": "WiFi Recovery Codes",
+      "notes": "Fake-Code-1111\nFake-Code-2222",
+      "folderId": "f1-aaaa-bbbb-cccc-000000000001",
+      "login": null,
+      "fields": []
+    },
+    {
+      "type": 2,
+      "name": "Server Notes",
+      "notes": "Rack 4, Unit 12, obviously fake",
+      "folderId": null,
+      "login": null,
+      "fields": []
+    },
+    {
+      "type": 3,
+      "name": "Example Identity",
+      "notes": "",
+      "folderId": null,
+      "identity": {"firstName": "Test", "lastName": "Person"},
+      "fields": []
+    }
+  ]
+}
