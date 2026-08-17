@@ -142,8 +142,15 @@ bool vaultUnlock(const char *pin) {
   VaultCryptoParams p;
   if (!vaultParamsLoad(p)) return false;
 
+  // Debug-only timing: lets a slow-unlock report be diagnosed from Serial
+  // instead of guessed at. Never logs the PIN itself — only elapsed ms and
+  // the iteration count already stored (non-secret) in NVS.
+  uint32_t kdfStart = millis();
   uint8_t kek[CK_KEY_LEN];
-  if (!ckDeriveKey(pin, p.salt, sizeof(p.salt), p.iterations, kek, sizeof(kek))) {
+  bool kdfOk = ckDeriveKey(pin, p.salt, sizeof(p.salt), p.iterations, kek, sizeof(kek));
+  SK_LOG("[VAULT] PBKDF2 (%lu iterations) took %lums\n",
+         (unsigned long)p.iterations, (unsigned long)(millis() - kdfStart));
+  if (!kdfOk) {
     return false;
   }
 
