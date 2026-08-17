@@ -451,8 +451,17 @@ static bool wifiPortalStartCommon() {
   }
 
   WiFi.mode(WIFI_AP);
-  // channel 1, not hidden, MAX 1 client
-  WiFi.softAP(portalSsid, portalPass, 1, 0, 1);
+  // channel 1, not hidden, up to 2 clients. This used to be capped at 1 —
+  // that starved the join itself on phones (esp. iOS) that open a silent
+  // background probe connection for captive-portal detection BEFORE the
+  // connection the user actually sees completes. With max_connection=1 that
+  // probe could occupy the only slot, so the real join failed or hung even
+  // standing right next to the device (not a range/power issue — reported
+  // as "can't get past the WiFi wait screen"). The portal's actual security
+  // boundary is unchanged: every state-changing route still requires the
+  // single per-session 6-digit code, so a second raw association slot does
+  // not let a second party do anything.
+  WiFi.softAP(portalSsid, portalPass, 1, 0, 2);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);            // cut the current spike
   delay(100);
   SK_LOG("[WIFI] post-start heap: free=%u minfree=%u\n",
