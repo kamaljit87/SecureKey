@@ -303,7 +303,17 @@ bool bwImportFeed(const uint8_t *chunk, size_t len) {
 // well-formed end of input (not just "no error yet" — a connection that
 // dropped mid-stream leaves the parser incomplete but not technically
 // errored, and that must ALSO be treated as a failure).
+//
+// [BW-09] marks entry to THIS function, BEFORE the file-close/flush below —
+// this is the earliest point this project's own finalize logic can log
+// after portalImportUploadDone() (wifi_portal.ino's [BW-08]) calls in. If
+// [BW-08] prints but [BW-09] never does, the reset happened in the few
+// lines between those two calls (the vaultUnlocked/portalImportCodeOk/
+// s_importUploadOk checks in portalImportUploadDone() — all simple boolean
+// reads, but logged separately so that window isn't invisible either).
 bool bwImportEnd() {
+  SK_LOG("[BW-09] bwImportEnd() entered  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
   if (bwImportCtx.stage != BW_STAGE_UPLOADING) return false;
 
   if (bwImportCtx.filesOpen) {
@@ -313,21 +323,24 @@ bool bwImportEnd() {
     bwImportCtx.foldersStagingFile.close();
     bwImportCtx.filesOpen = false;
   }
+  SK_LOG("[BW-10] Staging files flushed+closed  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
 
   if (!bwParserDone(bwImportCtx.parser)) {
-    SK_LOGLN("[BWIMPORT] upload incomplete (stream ended before valid JSON closed)");
+    SK_LOGLN("[BW-11] Parser NOT done — stream ended before valid JSON closed (treated as failure)");
     bwSetError("Upload incomplete or invalid");
     bwImportDiscard();
     return false;
   }
+  SK_LOGLN("[BW-12] Parser confirmed done (well-formed JSON received)");
 
-  SK_LOG("[BWIMPORT] upload complete: %u bytes received\n", bwImportCtx.parser.bytesFed);
-  SK_LOG("[BWIMPORT] parsed: %u logins, %u notes, %u folders, %u unsupported, %u duplicates\n",
-         bwImportCtx.loginsFound, bwImportCtx.notesFound, bwImportCtx.foldersFound,
-         bwImportCtx.unsupportedFound, bwImportCtx.duplicatesFound);
+  SK_LOG("[BW-13] Parsed: %u bytes, %u logins, %u notes, %u folders, %u unsupported, %u duplicates\n",
+         bwImportCtx.parser.bytesFed, bwImportCtx.loginsFound, bwImportCtx.notesFound,
+         bwImportCtx.foldersFound, bwImportCtx.unsupportedFound, bwImportCtx.duplicatesFound);
   SK_LOG("[BWIMPORT] post-parse memory: freeHeap=%u minFreeHeap=%u freePsram=%u\n",
          ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
   bwImportCtx.stage = BW_STAGE_AWAITING_PREVIEW;
+  SK_LOGLN("[BW-14] Stage set to AWAITING_PREVIEW — bwImportEnd() returning true");
   return true;
 }
 

@@ -422,7 +422,7 @@ static void portalImportUploadChunk() {
       // bwImportBegin() already ran when the portal entered import mode
       // (wifiPortalStartImportMode()) — nothing further to initialize here.
       // Counts/sizes/memory only — never filename/content.
-      SK_LOG("[BWIMPORT] upload started  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+      SK_LOG("[BW-01] Upload started  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
              ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
       break;
 
@@ -434,24 +434,39 @@ static void portalImportUploadChunk() {
       s_importChunkCount++;
       // Snapshot memory every ~32 chunks (~45 KB) rather than every chunk —
       // enough resolution to see a real leak/exhaustion trend during a large
-      // upload without flooding serial on every 1436-byte packet.
+      // upload without flooding serial on every 1436-byte packet. Reports
+      // bytes-so-far rather than a percentage — HTTPUpload.totalSize is not
+      // populated by this library until UPLOAD_FILE_END, so a true percent
+      // isn't available mid-transfer; report what's actually known instead
+      // of inventing a number.
       if ((s_importChunkCount % 32) == 0) {
-        SK_LOG("[BWIMPORT] chunk %u  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
-               s_importChunkCount, ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
+        SK_LOG("[BW-02] Receiving data  chunk=%u bytesSoFar=%u  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+               s_importChunkCount, (unsigned)upload.totalSize,
+               ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
       }
-      // THE ACTUAL FIX for the reboot-on-upload bug — see the file comment
-      // above this function for the full mechanism. Must run on every
-      // chunk, unconditionally, success or parser-error alike (a slow
+      // THE watchdog-starvation FIX from the previous pass — see the file
+      // comment above this function for the full mechanism. Must run on
+      // every chunk, unconditionally, success or parser-error alike (a slow
       // upload that's already failed parsing still needs to keep draining
-      // bytes off the socket without starving the watchdog).
+      // bytes off the socket without starving the watchdog). CONFIRMED
+      // still present here — this pass adds instrumentation on TOP of it,
+      // does not remove or alter it, since physical retest shows the crash
+      // has moved to AFTER 100%, not during the transfer this delay(1)
+      // already fixed.
       delay(1);
       break;
 
     case UPLOAD_FILE_END:
-      // Finalization happens in portalImportUploadDone() (the `fn` callback,
-      // called once after the whole request completes) — nothing to do here.
-      SK_LOG("[BWIMPORT] upload received: %u chunks, %u bytes total\n",
-             s_importChunkCount, (unsigned)upload.totalSize);
+      // This is the LAST point inside the WRITE/END callback before control
+      // returns to WebServer::_parseForm()'s own tail code (POST-arg
+      // cleanup / boundary handling — third-party library, Parsing.cpp,
+      // cannot be edited here) and then to portalImportUploadDone(). If a
+      // physical test shows [BW-07] printed but [BW-08] (below, in
+      // portalImportUploadDone()) never appears, the reset is happening
+      // inside that library tail code, not in this project's own logic.
+      SK_LOG("[BW-07] Upload reached 100%% — %u chunks, %u bytes total  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+             s_importChunkCount, (unsigned)upload.totalSize,
+             ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
       break;
 
     case UPLOAD_FILE_ABORTED:
@@ -487,7 +502,18 @@ static void portalImportVerifyCode() {
 // Called once after the full multipart request completes (success or the
 // client disconnected — WebServer still invokes this). Sends the actual
 // HTTP response.
+//
+// [BW-08] marks entry to THIS function — the first point of our own code
+// reached after WebServer::_parseForm() finishes its own tail (POST-arg
+// array cleanup, boundary-line handling; Parsing.cpp, third-party, cannot
+// be edited). If a physical serial capture shows [BW-07] (UPLOAD_FILE_END,
+// above) but never [BW-08], the reset is happening inside that library
+// tail code — useful to know definitively even though it isn't something
+// this project's own source can fix directly.
 static void portalImportUploadDone() {
+  SK_LOG("[BW-08] Upload finalized (entered response handler)  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
+
   if (!vaultUnlocked || !portalImportMode) {
     // The SESSION itself is no longer valid (vault locked / portal left
     // import mode) — distinct from "code was simply wrong", which a retry
@@ -513,6 +539,14 @@ static void portalImportUploadDone() {
   // screen on its own; this HTTP response just confirms upload success to
   // the browser.
   portalSrv.send(200, "text/plain", "ok");
+  // [BW-15]: proves the response was actually queued/sent from the
+  // device's own perspective. If the browser's XHR never receives this
+  // (i.e. it never sees the "Upload complete" status text update in
+  // portal_html.h's xhr.onload), but this line DOES print, the reset is
+  // happening after the device hands the response to the WiFi/TCP stack —
+  // i.e. downstream of our code, during the actual socket flush/teardown.
+  SK_LOG("[BW-15] HTTP 200 response sent to browser  freeHeap=%u minFreeHeap=%u freePsram=%u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
 }
 
 // POST /import/bitwarden/cancel?code=XXX — user cancelled from the phone's
